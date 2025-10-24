@@ -57,8 +57,6 @@ def extract_numeric_field(raw: str, left_label_regex: str) -> int:
     We scan for:
       BANK DEP ... AWARD ... H:MM
       TTL BANK ... OPTS AWARD ... H:MM
-
-    This is loose: it finds the first H:MM within ~40 chars after the label.
     """
     t = nbps(raw)
     pat = re.compile(
@@ -121,34 +119,33 @@ RES_FALLBACK_ELIGIBLE_CODES = {
     "SCC",
     "PVEL",
     "LOSA",
+    "VAC",        # <-- added VAC so PTO-style vacation credit stacks
     "ADJ-RRPY",
-    "ADJ",       # safety net: if ADJ shows without -RRPY
-    "ADJ/RRPY",  # being extra safe about formatting variants
+    "ADJ",
+    "ADJ/RRPY",
 }
 
 def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     """
     Parse each duty day row and identify:
     - has_credit_block:
-        a clear pairing-style credit block, e.g. '10:30 10:30 10:30 ...'
-        or '7:21 7:21 7:21 ...'
-        That time is already baked into SUB TTL CREDIT.
+        e.g. '10:30 10:30 10:30 ...' or '7:21 7:21 7:21 ...'
+        That time is already in SUB TTL CREDIT.
     - bump_pay_candidate:
-        the little add-on, like 0:07 / 1:22 / 0:13 / 3:23 / 3:38.
-        We detect it if the final time < the previous time.
-        This feeds ADDTL PAY ONLY COLUMN.
+        little add-on, like 0:07 / 1:22 / 0:13 / 3:23 / 3:38.
+        This is ADDTL PAY ONLY COLUMN.
     - main_pay_candidate:
         PAY TIME ONLY (PAY NO CREDIT).
         Rules:
-          • If nbr has 'RRPY' in it (RRPY, ADJ-RRPY, etc.), take the last time.
-          • If row ends with [big_time, then smaller bump], we can take big_time
-            UNLESS that big_time is:
-              - part of a 3x repeated credit block, OR
-              - on a TRANS row (we don't bill TRANS base time).
+          • If nbr has 'RRPY' in it (RRPY, ADJ-RRPY), last time counts.
+          • If row ends [big_time, smaller bump], big_time counts unless:
+                - row is TRANS, or
+                - big_time is clearly a 3x repeated credit block.
           • Reserve fallback:
-              If duty == RES, no credit block, and nbr is in RES_FALLBACK_ELIGIBLE_CODES
-              (SCC, PVEL, LOSA, ADJ-RRPY...), take the last time.
-              This prevents us from accidentally counting normal pairing credit like 10:30 10:30.
+                If duty == RES, no credit block,
+                nbr in RES_FALLBACK_ELIGIBLE_CODES (SCC, LOSA, PVEL, VAC, etc.),
+                take last time.
+                This is what adds SCC 1:00, LOSA 20:00, VAC 32:05, etc.
     """
     t = nbps(raw)
 
@@ -201,7 +198,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
         main_pay_candidate = None
 
-        # Case 1: 'RRPY' in pairing code means it's standalone pay (ADJ-RRPY, RRPY)
+        # Case 1: 'RRPY' in pairing code means it's standalone pay (RRPY, ADJ-RRPY...)
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
@@ -229,11 +226,10 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # Case 3 (reserve fallback logic):
         # Only for RES rows:
         # - no credit block
-        # - nbr looks like SCC / PVEL / LOSA / ADJ-RRPY etc.
+        # - nbr is in whitelist of reserve-paid codes
         # - take the last time token
         #
-        # This keeps SCC 1:00, PVEL 10:00, LOSA 10:00,
-        # but *doesn't* grab generic pairing codes like 0991 10:30 10:30.
+        # This now includes VAC, so vacation pay stacks for reserve months.
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 if nbr in RES_FALLBACK_ELIGIBLE_CODES:
@@ -361,13 +357,13 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         total_mins = (
             base_mins
             + comps["res_assign_gslip_mins"]
-            # reserve DOES NOT add G/SLIP PAY
+            # reserve does NOT add G/SLIP PAY
         )
     else:
         total_mins = (
             base_mins
             + comps["g_slip_pay_mins"]
-            # lineholder DOES NOT add RES ASSIGN-G/SLIP PAY
+            # lineholder does NOT add RES ASSIGN-G/SLIP PAY
         )
 
     comps["total_mins"] = total_mins
@@ -394,7 +390,7 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve example (John Oct). Expected ~103:56 after this fix.
+    # Reserve example (October John ~103:56 logic)
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -414,7 +410,7 @@ if example_btn_res:
     )
 
 if example_btn_line:
-    # Lineholder example (Christophe June). Expected ~109:27.
+    # Lineholder example (June Christophe ~109:27 logic)
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
