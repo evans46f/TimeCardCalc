@@ -48,10 +48,19 @@ def detect_card_type(raw: str) -> str:
 # ======================================================
 
 def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parse only the actual duty rows (not summary blocks).
+    Stops at RES OTHER SUB TTL, CREDIT APPLICABLE, or END OF DISPLAY.
+    """
     t = clean(raw)
     seg_re = re.compile(
-        r"(?P<date>\d{2}[A-Z]{3})\s+REG\s+(?P<nbr>[A-Z0-9/-]+)(?P<tail>.*?)(?="
-        r"\d{2}[A-Z]{3}\s+REG\b|END OF DISPLAY|$)",
+        r"(?P<date>\d{2}[A-Z]{3})\s+REG\s+(?P<nbr>[A-Z0-9/-]+)"
+        r"(?P<tail>.*?)(?="
+        r"\d{2}[A-Z]{3}\s+REG\b|"  # next duty row
+        r"RES\s+OTHER\s+SUB\s+TTL|"  # start of summary
+        r"CREDIT\s+APPLICABLE|"      # start of summary
+        r"END OF DISPLAY|$"          # end of block
+        r")",
         re.I | re.S,
     )
 
@@ -66,6 +75,7 @@ def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
             "raw": seg_full.strip(),
         })
     return rows
+
 
 # ======================================================
 # Numeric extractors
