@@ -106,13 +106,13 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
       G/SLIP PAY : 10:30
       ASSIGN PAY: 0:00
       RES ASSIGN-G/SLIP PAY: 5:15
+      REROUTE PAY: 0:00
       BANK DEP AWARD 0:00
       TTL BANK OPTS AWARD 0:00
-      REROUTE PAY: 0:00
     """
     t = clean(text)
     for lbl in labels:
-        # try "LABEL : H:MM"
+        # version with colon
         pat_colon = re.compile(
             re.escape(lbl) + r"\s*:\s*([0-9]{1,3}:[0-5][0-9])",
             flags=re.I,
@@ -121,7 +121,7 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
         if m:
             return to_minutes(m.group(1))
 
-        # try "LABEL H:MM" (no colon)
+        # version without colon
         pat_nocolon = re.compile(
             re.escape(lbl) + r"\s+([0-9]{1,3}:[0-5][0-9])",
             flags=re.I,
@@ -134,13 +134,10 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
 
 def grab_sub_ttl_credit_minutes(raw: str) -> int:
     """
-    We want the final total credit from the guarantee math block.
-    e.g.:
-      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
-      -> 72:00
-    or:
-      10:30 + 40:49 + 0:00 = 51:19 - 0:00 + 0:00 = 51:19
-      -> 51:19
+    We want the FINAL total credit from the guarantee math block.
+    Examples:
+      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00  -> 72:00
+      10:30 + 40:49 + 0:00 = 51:19 - 0:00 + 0:00 = 51:19 -> 51:19
     """
     t = clean(raw)
     eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
@@ -148,14 +145,30 @@ def grab_sub_ttl_credit_minutes(raw: str) -> int:
         return to_minutes(eq_times[-1])
     return 0
 
+def extract_training_pay_minutes(raw: str) -> int:
+    """
+    Sum all 'DISTRIBUTED TRNG PAY:' lines.
+    Example:
+      ... DISTRIBUTED TRNG PAY:   1:52
+    """
+    t = clean(raw)
+    total = 0
+    for m in re.finditer(
+        r"DISTRIBUTED\s+TRNG\s+PAY:\s+([0-9]{1,3}:[0-5][0-9])",
+        t,
+        flags=re.I,
+    ):
+        total += to_minutes(m.group(1))
+    return total
+
 # ======================================================
 # Lineholder Logic
 # ======================================================
 
 def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
-    PAY TIME ONLY for lineholder = sum of rows that have exactly ONE time value
-    (e.g. 'REG RRPY 3:09', 'REG RRPY 5:26', etc).
+    PAY TIME ONLY for lineholder = sum of rows that have exactly ONE time
+    (e.g. 'REG RRPY 3:09', 'REG RRPY 5:26', single guarantee-only lines).
     """
     total = 0
     for r in rows:
@@ -167,8 +180,8 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
     ADDTL PAY ONLY COLUMN for lineholder:
-    If last time < previous time, add the last time
-    (e.g. tails like 0:13, 0:38, 3:38, 3:23).
+    If the last time is smaller than the one before it, add the last time.
+    (captures tails like 0:13, 0:38, 3:38, 3:23...)
     """
     total = 0
     for r in rows:
@@ -187,25 +200,30 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 def calc_pay_time_only_reserve(rows: List[Dict[str, Any]]) -> int:
     """
     PAY TIME ONLY (PAY NO CREDIT) for Reserve.
-    We ONLY count rows with 'guarantee codes' like SCC, LOSA, PRPL, TRVL, VAC.
-    For those rows, take the LAST time on the row.
-    We EXCLUDE normal trip/rotation codes (0427, 5464, 0961...) because their
-    credit is already in SUB TTL CREDIT.
+
+    Include ONLY rows whose NBR is a 'guarantee-type' code:
+      SCC, LOSA, PRPL, TRVL, VAC, RRPY
+    Exclude SICK and actual pairings (0431, 5501, etc.) because those are
+    already included in SUB TTL CREDIT.
+
+    For included rows, take the LAST time on that row.
     """
-    guarantee_codes = {"SCC", "LOSA", "PRPL", "TRVL", "VAC"}
+    guarantee_codes = {"SCC", "LOSA", "PRPL", "TRVL", "VAC", "RRPY"}
 
     total = 0
     for r in rows:
         code = r["nbr"].upper()
         times = r["times"]
-        if code in guarantee_codes and times:
+        if not times:
+            continue
+        if code in guarantee_codes:
             total += to_minutes(times[-1])
     return total
 
 def calc_addtl_pay_only_reserve(rows: List[Dict[str, Any]]) -> int:
     """
     ADDTL PAY ONLY COLUMN for Reserve:
-    tail bumps where final time is less than the one before it.
+    Tail bumps where final time is less than the time right before it.
     """
     total = 0
     for r in rows:
@@ -256,7 +274,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         }
 
     else:
-        # ----- RESERVE -----
+        # RESERVE
         rows = parse_reserve_rows(raw)
 
         sub_ttl_mins = grab_sub_ttl_credit_minutes(raw)
@@ -296,14 +314,13 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             "TOTAL": from_minutes(total_mins),
         }
 
-
 # ======================================================
 # Streamlit UI
 # ======================================================
 
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Auto-detects RESERVE vs LINEHOLDER and applies the correct math for that type.")
+st.caption("Auto-detects RESERVE vs LINEHOLDER and applies the correct rules for that type.")
 
 def handle_clear():
     st.session_state["timecard_text"] = ""
@@ -341,6 +358,7 @@ with st.sidebar:
             "31DEC RES SCC 1:00 1:00 "
             "10:30 + 40:49 + 0:00 = 51:19 - 0:00 + 0:00 = 51:19 "
             "RES ASSIGN-G/SLIP PAY: 5:15 "
+            "DISTRIBUTED TRNG PAY: 1:52 "
             "END OF DISPLAY"
         )
 
