@@ -420,7 +420,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Auto-detects RESERVE vs LINEHOLDER. Applies the right contract math.")
+st.caption("Auto-detects RESERVE vs LINEHOLDER.")
 
 # --- Sidebar inputs / example loaders ---
 with st.sidebar:
