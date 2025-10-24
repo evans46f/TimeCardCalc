@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("🕘 Monthly Time Data Calculator (OCR Beta)")
-st.caption("Upload a screenshot of your Monthly Time Data page. We'll read it, parse it, and total your hours — locally, using Tesseract OCR (no cloud).")
+st.caption("Upload a screenshot of your Monthly Time Data page. We'll read it, parse it, and total your hours — locally, using Tesseract OCR (no cloud upload).")
 
 uploaded_file = st.file_uploader(
     "Upload screenshot (.png, .jpg, .jpeg)",
@@ -54,10 +54,28 @@ def ocr_image_to_text(pil_image: Image.Image) -> str:
     """
     Run Tesseract OCR on the screenshot and return the raw text.
     We set --psm 6 (assume a uniform block of text with columns).
-    You can tune this later if needed.
     """
     custom_config = r"--psm 6"
     return pytesseract.image_to_string(pil_image, config=custom_config)
+
+def crop_ocr_to_timecard_section(raw_text: str) -> str:
+    """
+    We only want to parse the actual timecard table.
+    To cut down junk, we:
+      - find the first line that contains 'MONTHLY TIME DATA'
+      - keep everything from there downward
+    If we can't find it, we just return the original text.
+    """
+    lines = raw_text.splitlines()
+
+    start_index = 0
+    for i, line in enumerate(lines):
+        if "MONTHLY TIME DATA" in line.upper():
+            start_index = i
+            break
+
+    trimmed_lines = lines[start_index:]
+    return "\n".join(trimmed_lines)
 
 def normalize_row(des: str, time_list):
     """
@@ -111,17 +129,16 @@ def normalize_row(des: str, time_list):
 
 def parse_timecard_lines(ocr_text: str) -> pd.DataFrame:
     """
-    Take the raw OCR text and extract rows that look like daily entries.
+    Take OCR text for the relevant section only and extract daily entries.
 
-    We expect rows like:
-    05OCT  REG 3324  8:50 10:30 10:30 10:30
-    06OCT  RES SCC       1:00  1:00
+    Expected shapes:
+      05OCT  REG 3324   8:50  10:30 10:30 10:30
+      06OCT  RES SCC          1:00  1:00
 
     We'll:
-    - Identify each row using a regex
-    - Map any found times using normalize_row()
-    - Return a DataFrame with columns:
-      DATE, DES, NBR, BLOCK, SKED, PAY, CREDIT
+    - Break text into lines
+    - Try to match each line with regex
+    - Use normalize_row() to map times into BLOCK/SKED/PAY/CREDIT
     """
 
     # Split into lines and strip blanks
@@ -129,13 +146,11 @@ def parse_timecard_lines(ocr_text: str) -> pd.DataFrame:
 
     rows = []
 
-    # Regex assumptions:
-    # DATE: 2 digits + 3 letters (e.g. 05OCT, 15OCT)
-    # DES:  word like REG, RES, RSV, etc. (uppercase, no spaces)
+    # Regex:
+    # DATE: 2 digits + 3 letters (like 05OCT)
+    # DES:  word like REG, RES, RSV, etc.
     # NBR:  alphanumeric trip/code like 3324, SCC, 0991
-    # followed by up to four time values (hh:mm)
-    #
-    # We keep them as T1..T4; we'll interpret them with normalize_row.
+    # Up to four time groups (hh:mm)
     row_pattern = re.compile(
         r"^(?P<DATE>\d{2}[A-Z]{3})\s+"
         r"(?P<DES>[A-Z]+)\s+"
@@ -154,9 +169,7 @@ def parse_timecard_lines(ocr_text: str) -> pd.DataFrame:
 
         g = m.groupdict()
 
-        # Collect up to four time tokens
         t_values = [g.get("T1"), g.get("T2"), g.get("T3"), g.get("T4")]
-
         block, sked, pay, cred = normalize_row(g["DES"], t_values)
 
         rows.append({
@@ -170,26 +183,23 @@ def parse_timecard_lines(ocr_text: str) -> pd.DataFrame:
         })
 
     if not rows:
-        # no matches -> return empty frame with expected columns
         return pd.DataFrame(columns=["DATE","DES","NBR","BLOCK","SKED","PAY","CREDIT"])
 
     df = pd.DataFrame(rows)
 
-    # Drop duplicates (OCR can sometimes stutter-read)
+    # Drop duplicates (OCR can sometimes double-read)
     df = df.drop_duplicates()
 
     # Filter out accidental header captures like "DATE DES NBR BLOCK ..."
     df = df[~df["DATE"].str.contains("DATE", na=False)]
 
-    # Reset index
     df = df.reset_index(drop=True)
 
     return df
 
-
 def compute_totals(df: pd.DataFrame) -> dict:
     """
-    Calculate total credit/pay time for the month.
+    Calculate total monthly credit/pay.
     We prioritize CREDIT. If CREDIT is blank for a row,
     we fall back to PAY for that row.
     """
@@ -205,7 +215,6 @@ def compute_totals(df: pd.DataFrame) -> dict:
 
     df_work = df.copy()
 
-    # choose CREDIT if present else PAY
     effective_credit_col = []
     for _, r in df_work.iterrows():
         if r["CREDIT"]:
@@ -239,7 +248,10 @@ else:
 
     # OCR
     with st.spinner("Reading your timecard..."):
-        raw_text = ocr_image_to_text(img)
+        raw_text_full = ocr_image_to_text(img)
+
+    # Trim OCR text so we only start at MONTHLY TIME DATA
+    raw_text = crop_ocr_to_timecard_section(raw_text_full)
 
     # Parse OCR text -> structured rows
     df = parse_timecard_lines(raw_text)
@@ -266,9 +278,12 @@ else:
             hide_index=True
         )
 
-    # Debugging / power user panel
+    # Debug / advanced info so we can keep iterating
     with st.expander("Advanced / Debug"):
-        st.write("🔎 OCR text captured:")
+        st.write("🔎 Raw OCR text (full):")
+        st.text(raw_text_full)
+
+        st.write("🔎 Trimmed OCR text (starting at 'MONTHLY TIME DATA'):")
         st.text(raw_text)
 
         st.write("Parsed DataFrame with computed minutes:")
