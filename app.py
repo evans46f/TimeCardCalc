@@ -256,7 +256,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         }
 
     else:
-        # RESERVE
+        # ----- RESERVE -----
         rows = parse_reserve_rows(raw)
 
         sub_ttl_mins = grab_sub_ttl_credit_minutes(raw)
@@ -268,6 +268,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         res_assign_gslip_mins = extract_named_bucket(raw, ["RES ASSIGN-G/SLIP PAY"])
         bank_dep_mins = extract_named_bucket(raw, ["BANK DEP AWARD"])
         ttl_bank_mins = extract_named_bucket(raw, ["TTL BANK OPTS AWARD"])
+        training_mins = extract_training_pay_minutes(raw)
 
         total_mins = (
             sub_ttl_mins
@@ -278,6 +279,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             + res_assign_gslip_mins
             + bank_dep_mins
             + ttl_bank_mins
+            + training_mins
         )
 
         return {
@@ -290,8 +292,10 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             "RES ASSIGN-G/SLIP PAY": from_minutes(res_assign_gslip_mins),
             "BANK DEP AWARD": from_minutes(bank_dep_mins),
             "TTL BANK OPTS AWARD": from_minutes(ttl_bank_mins),
+            "DISTRIBUTED TRNG PAY": from_minutes(training_mins),
             "TOTAL": from_minutes(total_mins),
         }
+
 
 # ======================================================
 # Streamlit UI
