@@ -305,7 +305,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             + addtl_only_mins
             + reroute_mins
             + assign_mins
-            # DO NOT include res_assign_gslip_mins in reserve total
+            + res_assign_gslip_mins     # <-- back IN
             + bank_dep_mins
             + ttl_bank_mins
             + training_mins
