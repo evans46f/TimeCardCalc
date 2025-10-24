@@ -111,7 +111,7 @@ def extract_ttl_bank_opts_award(raw: str) -> int:
 def extract_sub_ttl_credit(raw: str) -> int:
     """
     SUB TTL CREDIT for reserve.
-    Example reserve block:
+    Example:
       ... SUB TTL CREDIT ... 56:20 ...
       10:30 + 45:50 + 0:00 = 56:20 - 0:00 + 0:00 = 56:20
     We want the first '= H:MM' (56:20 in example).
@@ -301,14 +301,12 @@ def extract_ttl_credit_final(raw: str) -> int:
     """
     TTL CREDIT for lineholder.
     We want final total credit after bank/opts fill.
-    Example:
-      68:34 - 0:00 + 3:26 = 72:00
-    -> 72:00
-    We'll take the LAST '= H:MM' group on that guarantee math line.
+    Example line:
+      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
+    TTL CREDIT = 72:00 (the last '= H:MM').
     """
     t = clean(raw)
 
-    # pull all '= H:MM', take the last
     eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
     if eq_times:
         return to_minutes(eq_times[-1])
@@ -352,11 +350,12 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
     PAY TIME ONLY (PAY NO CREDIT) for lineholder:
     - RRPY rows: add the time (ex: 3:09, 5:26)
-    - Non-TRANS rows with a bump tail:
-        e.g. "1:35 10:30 10:30 3:23"
-        last < prev_last, so add prev_last (10:30)
-    - We do NOT count TRANS rows in this bucket.
-      (01JUN has TRANS so 10:49 doesn't count here)
+    - Non-TRANS rows with a bump tail (last < prev_last):
+        include prev_last ONLY if prev_last appears exactly twice
+        in that row (short-day min guarantee like 28JUN).
+    - Skip TRANS rows here.
+    - Skip rows where prev_last is repeated 3+ times
+      (full pairing credit rows like 23JUN, 26JUN).
     """
     total = 0
 
@@ -370,11 +369,15 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 
         # bump-tail rule (non-TRANS only)
         if (not r["has_trans"]) and len(times) >= 3:
-            prev_last = to_minutes(times[-2])
+            prev_last_str = times[-2]
+            prev_last = to_minutes(prev_last_str)
             last = to_minutes(times[-1])
+
             if last < prev_last:
-                total += prev_last
-                continue
+                cnt_prev_last = times.count(prev_last_str)
+                if cnt_prev_last == 2:
+                    total += prev_last
+                    continue
 
     return total
 
@@ -384,7 +387,7 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     ADDTL PAY ONLY COLUMN for lineholder:
     - If last < prev_last, add last.
     - This DOES include TRANS rows.
-      Examples that count: 0:13, 0:38, 3:38, 3:23
+      (01JUN 0:13, 23JUN 0:38, 26JUN 3:38, 28JUN 3:23)
     """
     total = 0
     for r in rows:
@@ -399,23 +402,29 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 
 def build_lineholder_debug_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Show how each REG row contributed.
+    Show how each REG row contributed to:
+    - PAY TIME ONLY
+    - ADDTL PAY ONLY
     """
     out = []
     for r in rows:
         times = r["times"]
 
-        # what we counted into PAY TIME ONLY
+        # PAY TIME ONLY logic (text form for display)
         pay_only_add = ""
         if "RRPY" in r["nbr"] and times:
             pay_only_add = from_minutes(to_minutes(times[-1]))
         elif (not r["has_trans"]) and len(times) >= 3:
-            prev_last = to_minutes(times[-2])
+            prev_last_str = times[-2]
+            prev_last = to_minutes(prev_last_str)
             last = to_minutes(times[-1])
-            if last < prev_last:
-                pay_only_add = from_minutes(prev_last)
 
-        # what we counted into ADDTL PAY ONLY
+            if last < prev_last:
+                cnt_prev_last = times.count(prev_last_str)
+                if cnt_prev_last == 2:
+                    pay_only_add = from_minutes(prev_last)
+
+        # ADDTL PAY ONLY logic
         addtl_only_add = ""
         if len(times) >= 2:
             prev_last = to_minutes(times[-2])
