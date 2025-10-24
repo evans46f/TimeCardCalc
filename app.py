@@ -171,16 +171,20 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         If NBR contains 'RRPY', last H:MM on that row is PAY TIME ONLY.
         Works for RES and REG.
 
-      Rule B (RES flat/guarantee pay days like SCC, LOSA, PVEL, VAC, 20WD, etc):
+      Rule B (RES guarantee-style days like SCC, LOSA, VAC, 20WD, etc):
         duty == RES
         row not 'SICK'/'TOFF'
         row not TRANS
-        row not a 3x credit block (has_credit_block == False)
-        We used to require all times identical.
-        NOW we allow either:
-          - all times identical
-          - OR: last two times are identical (e.g. "1:23 5:15 5:15")
-        If so, that repeated last time is PAY TIME ONLY.
+        not a "pairing credit block"
+        We allow either:
+          - all times identical (e.g. '1:00 1:00', '15:00 15:00', '29:45 29:45')
+          - OR last two times identical (e.g. '2:35 5:15 5:15')
+        Then that last repeated time counts as PAY TIME ONLY.
+
+        We EXCLUDE pure pairing-credit rows like:
+          '9:38 10:30 10:30 10:30'
+        Those already flow into SUB TTL CREDIT. We detect those by
+        saying: if the LAST THREE times are identical, it's a credit block.
 
       Rule C (REG single-pay guarantee like "44WD 10:00"):
         duty == REG
@@ -191,18 +195,18 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
       Rule D (REG partial-credit-with-tail, e.g. "1:35 10:30 10:30 3:23"):
         duty == REG
         not TRANS
-        not has_credit_block
+        not pairing-credit-block
         len(times) >= 3
-        we detected an ADDTL PAY ONLY tail on this row
-        -> the second-to-last time is PAY TIME ONLY
-        (That captures the 10:30 we add on top of SUB TTL CREDIT.)
+        row has a bump tail (ADDTL PAY ONLY)
+        -> second-to-last time is PAY TIME ONLY
+        (That captures the 10:30 we stack on top of SUB TTL CREDIT.)
 
     ADDTL PAY ONLY logic:
       bump_pay_candidate is captured if:
         len(times) >= 2
         final time < previous time (numerically)
         AND final time != very first time
-      That's how we pick up 0:07, 1:22, 0:13, 3:38, 3:23, etc.
+      That's how we get 0:07, 1:22, 0:13, 3:38, 3:23, etc.
     """
     t = nbps(raw)
 
@@ -231,18 +235,20 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # All H:MM tokens on this row:
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # "TRANS" in row?
+        # Does the row mention TRANS?
         has_trans = "TRANS" in tail_text.upper()
 
-        # pairing credit block? (e.g. "10:30 10:30 10:30 0:07")
+        # pairing credit block?
+        # We treat a row as a "credit block row" if the LAST THREE times are identical.
+        # Examples:
+        #   "9:38 10:30 10:30 10:30" → last three are 10:30,10:30,10:30 → pairing credit
+        #   "7:24 10:30 10:30 10:30 0:07" still ends with triple 10:30 before tail
         has_credit_block = False
-        if len(times) >= 4:
-            before_last = times[:-1]
-            last3 = before_last[-3:]
-            if len(last3) == 3 and len(set(last3)) == 1:
+        if len(times) >= 3:
+            if len(set(times[-3:])) == 1:
                 has_credit_block = True
 
-        # ADDTL PAY ONLY candidate (the little 'tail' at the end)
+        # ADDTL PAY ONLY candidate (tail)
         bump_pay_candidate = None
         if len(times) >= 2:
             prev_time = times[-2]
@@ -259,7 +265,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         if "RRPY" in nbr and times:
             main_pay_candidate = times[-1]
 
-        # -------- Rule B: RES guarantee-style (SCC / LOSA / VAC / etc)
+        # -------- Rule B: RES guarantee-style SCC / LOSA / VAC / 20WD / etc
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 if nbr not in ("SICK", "TOFF") and not has_trans:
@@ -268,7 +274,6 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                     last_two_same = (
                         len(times) >= 2 and times[-1] == times[-2]
                     )
-                    # If either condition, count the last time as PAY ONLY
                     if all_same or last_two_same:
                         main_pay_candidate = times[-1]
 
@@ -355,7 +360,7 @@ def compute_components(raw: str) -> Dict[str, Any]:
             "NBR": r["nbr"],
             "Times": ", ".join(r["times"]),
             "TRANS row?": "Y" if r["has_trans"] else "N",
-            "Has credit block (3x repeat)?": "Y" if r["has_credit_block"] else "N",
+            "Has credit block (triple same at end)?": "Y" if r["has_credit_block"] else "N",
             "Added to PAY TIME ONLY": from_minutes(add_main) if add_main else "",
             "Added to ADDTL PAY ONLY": from_minutes(add_bump) if add_bump else "",
             "Raw Row Snippet": r["raw"][:200],
@@ -453,7 +458,7 @@ with st.sidebar:
             "01MAR RES SCC 1:00 1:00 "
             "0:00 + 35:18 + 0:00 = 35:18 - 0:00 + 0:00 = 35:18 "
             "BANK DEP AWARD 0:00 "
-            'RES ASSIGN-G/SLIP PAY: 5:15 '
+            "RES ASSIGN-G/SLIP PAY: 5:15 "
             "REROUTE PAY: 0:00 "
             "DISTRIBUTED TRNG PAY: 1:00 "
             "END OF DISPLAY"
