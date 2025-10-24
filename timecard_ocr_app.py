@@ -4,9 +4,6 @@ import pytesseract
 import pandas as pd
 import re
 
-# =========================
-# Streamlit config
-# =========================
 st.set_page_config(
     page_title="Timecard Calculator",
     layout="wide"
@@ -20,15 +17,9 @@ uploaded_file = st.file_uploader(
     type=["png", "jpg", "jpeg"]
 )
 
-# =========================
-# Helper functions
-# =========================
+# ---------- helpers ----------
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    """
-    Convert '10:30' -> 630 minutes.
-    Returns 0 if invalid or blank.
-    """
     if not isinstance(hhmm, str):
         return 0
     hhmm = hhmm.strip()
@@ -43,166 +34,187 @@ def hhmm_to_minutes(hhmm: str) -> int:
         return 0
 
 def minutes_to_hhmm(total_minutes: int) -> str:
-    """
-    Convert 630 -> '10:30' with zero padding.
-    """
     hours = total_minutes // 60
     mins = total_minutes % 60
     return f"{hours:02d}:{mins:02d}"
 
 def ocr_image_to_text(pil_image: Image.Image) -> str:
-    """
-    Run Tesseract OCR on the screenshot and return the raw text.
-    We set --psm 6 (assume a uniform block of text with columns).
-    """
     custom_config = r"--psm 6"
     return pytesseract.image_to_string(pil_image, config=custom_config)
 
 def crop_ocr_to_timecard_section(raw_text: str) -> str:
-    """
-    We only want to parse the actual timecard table.
-    To cut down junk, we:
-      - find the first line that contains 'MONTHLY TIME DATA'
-      - keep everything from there downward
-    If we can't find it, we just return the original text.
-    """
     lines = raw_text.splitlines()
-
     start_index = 0
     for i, line in enumerate(lines):
         if "MONTHLY TIME DATA" in line.upper():
             start_index = i
             break
-
     trimmed_lines = lines[start_index:]
     return "\n".join(trimmed_lines)
 
+def clean_line(line: str) -> str:
+    """
+    Make OCR'd line closer to what we expect.
+    - Fix @60CT → 06OCT, @90CT → 09OCT, 110CT → 11OCT, etc.
+    - Fix 0CT → OCT (OCR saw zero instead of O)
+    - Normalize spacing
+    - Strip leading garbage symbols like '@'
+    """
+
+    # Kill leading weird symbol(s) like '@' at start of line
+    line = line.lstrip("@#*()[]{}<>~|`•-_=+,:;")
+
+    # Replace things like '0CT' with 'OCT'
+    # We only do this when it's clearly the month code (OCT)
+    # If we see \d{2}0CT or \d{2}OCT both mean OCT.
+    # We'll normalize "0CT" => "OCT"
+    line = re.sub(r"0CT", "OCT", line, flags=re.IGNORECASE)
+
+    # Sometimes first char of day gets OCR'd as @ instead of digit
+    # e.g. "@60CT" should be "06OCT"
+    # We'll try patterns like:
+    # ^@(\d)OCT  => 0<digit>OCT
+    # ^@(\d{2})OCT => <2digits>OCT
+    m = re.match(r"^@(\d{1,2})OCT", line, flags=re.IGNORECASE)
+    if m:
+        day = m.group(1)
+        # zero pad day to 2 digits
+        if len(day) == 1:
+            day = "0" + day
+        line = re.sub(r"^@(\d{1,2})OCT", day + "OCT", line, flags=re.IGNORECASE)
+
+    # Another case: "110CT" → "11OCT", "150CT" → "15OCT"
+    line = re.sub(r"\b(\d{1,2})0CT\b", r"\1OCT", line, flags=re.IGNORECASE)
+
+    # Collapse multiple spaces/tabs to a single space
+    line = re.sub(r"\s+", " ", line).strip()
+
+    return line
+
+def is_date_token(tok: str) -> bool:
+    """
+    We consider something a DATE token if it looks like DDMMM
+    where DD is 1-2 digits, MMM is 3 letters. ex: 06OCT, 6OCT, 15OCT, 19OCT
+    """
+    return re.match(r"^\d{1,2}[A-Z]{3}$", tok.upper()) is not None
+
+def is_time_token(tok: str) -> bool:
+    """
+    HH:MM where H or HH and MM are 2 digits.
+    """
+    return re.match(r"^\d{1,2}:\d{2}$", tok) is not None
+
 def normalize_row(des: str, time_list):
     """
-    Map the list of up to four hh:mm values in that row
-    into BLOCK, SKED, PAY, CREDIT using two rule sets:
+    Reserve vs lineholder mapping.
 
-    Rule set A: Reserve / SCC style days
-        - DES like RES, RSV, RESERVE, SCC, etc.
-        - Usually no BLOCK, and SKED/PAY/CREDIT are basically duty/credit
-    Rule set B: Lineholder / REG flying days
-        - BLOCK, SKED, PAY, CREDIT left-to-right
+    Reserve-ish DES: RES, RSV, RESV, RESERVE, SCC
+      - BLOCK = ""
+      - SKED  = first time
+      - PAY   = second time (fallback = first)
+      - CREDIT = last time (fallback = first)
 
-    We also make CREDIT robust:
-    - If CREDIT is missing, fall back to PAY.
-    - For reserve, CREDIT usually equals PAY anyway.
+    Lineholder-ish:
+      - BLOCK = first
+      - SKED  = second
+      - PAY   = third (fallback=second)
+      - CREDIT= fourth (fallback=PAY)
     """
     des_clean = (des or "").upper()
-
-    # treat these as reserve-type days
     is_reserve_day = (
-        des_clean.startswith("RES") or  # RES / RESV / RESERVE
-        des_clean.startswith("RSV") or  # RSV
-        des_clean == "SCC"              # SCC as seen in reserve examples
+        des_clean.startswith("RES") or
+        des_clean.startswith("RSV") or
+        des_clean == "SCC"
     )
 
-    # filter out None / '' so indexing works cleanly
     tvals = [t for t in time_list if t]
 
     if is_reserve_day:
-        # Reserve logic:
-        # BLOCK is generally empty
         block = ""
-        # first seen -> SKED
         sked  = tvals[0] if len(tvals) > 0 else ""
-        # second seen -> PAY (fallback to SKED if missing)
         pay   = tvals[1] if len(tvals) > 1 else sked
-        # CREDIT is usually same as PAY unless there's a later explicit number
         cred  = tvals[-1] if len(tvals) >= 2 else sked
         return block, sked, pay, cred
 
-    # Lineholder / REG flying logic:
-    # Expected order = BLOCK, SKED, PAY, CREDIT
+    # lineholder/flying
     block = tvals[0] if len(tvals) > 0 else ""
     sked  = tvals[1] if len(tvals) > 1 else ""
-    # PAY: if missing, fall back to SKED
     pay   = tvals[2] if len(tvals) > 2 else (tvals[1] if len(tvals) > 1 else "")
-    # CREDIT: if missing, fall back to PAY
     cred  = tvals[3] if len(tvals) > 3 else pay
-
     return block, sked, pay, cred
 
 def parse_timecard_lines(ocr_text: str) -> pd.DataFrame:
     """
-    Take OCR text for the relevant section only and extract daily entries.
+    Token-based parser:
+    1. Clean each line.
+    2. Split into tokens.
+    3. Expect tokens like:
+        DATE DES NBR <time> <time> <time> ...
+       where:
+        DATE = DDMMM (e.g. 06OCT, 15OCT)
+        DES  = REG/RES/etc.
+        NBR  = trip#/code like 3324, SCC, 0991, LOSA, etc.
+       The rest that look like HH:MM are time fields.
 
-    Expected shapes:
-      05OCT  REG 3324   8:50  10:30 10:30 10:30
-      06OCT  RES SCC          1:00  1:00
-
-    We'll:
-    - Break text into lines
-    - Try to match each line with regex
-    - Use normalize_row() to map times into BLOCK/SKED/PAY/CREDIT
+    We collect those time fields (could be 1, 2, 3, 4, 5...) and feed to normalize_row().
     """
 
-    # Split into lines and strip blanks
-    lines = [ln.strip() for ln in ocr_text.split("\n") if ln.strip()]
+    parsed_rows = []
 
-    rows = []
-
-    # Regex:
-    # DATE: 2 digits + 3 letters (like 05OCT)
-    # DES:  word like REG, RES, RSV, etc.
-    # NBR:  alphanumeric trip/code like 3324, SCC, 0991
-    # Up to four time groups (hh:mm)
-    row_pattern = re.compile(
-        r"^(?P<DATE>\d{2}[A-Z]{3})\s+"
-        r"(?P<DES>[A-Z]+)\s+"
-        r"(?P<NBR>[A-Z0-9]+)"
-        r"(?:\s+(?P<T1>\d{1,2}:\d{2}))?"
-        r"(?:\s+(?P<T2>\d{1,2}:\d{2}))?"
-        r"(?:\s+(?P<T3>\d{1,2}:\d{2}))?"
-        r"(?:\s+(?P<T4>\d{1,2}:\d{2}))?"
-        r"$"
-    )
-
-    for ln in lines:
-        m = row_pattern.match(ln)
-        if not m:
+    # go line by line
+    for raw_line in ocr_text.splitlines():
+        if not raw_line.strip():
             continue
 
-        g = m.groupdict()
+        line = clean_line(raw_line)
 
-        t_values = [g.get("T1"), g.get("T2"), g.get("T3"), g.get("T4")]
-        block, sked, pay, cred = normalize_row(g["DES"], t_values)
+        # skip obvious section headers / totals lines etc.
+        # We only want rows that start with a DATE token like 06OCT/15OCT/etc.
+        tokens = line.split(" ")
 
-        rows.append({
-            "DATE": g["DATE"],
-            "DES": g["DES"],
-            "NBR": g["NBR"],
+        if len(tokens) < 3:
+            continue
+
+        # tokens[0] should be DATE-like
+        if not is_date_token(tokens[0]):
+            continue
+
+        # after DATE we expect DES then NBR
+        # Example:
+        # 06OCT RES SCC 1:00 1:00
+        # DATE=06OCT DES=RES NBR=SCC times=[1:00,1:00]
+        date_tok = tokens[0].upper()
+        des_tok  = tokens[1].upper()
+        nbr_tok  = tokens[2]
+
+        # remaining tokens that are HH:MM
+        time_tokens = [t for t in tokens[3:] if is_time_token(t)]
+
+        block, sked, pay, cred = normalize_row(des_tok, time_tokens)
+
+        parsed_rows.append({
+            "DATE": date_tok,
+            "DES": des_tok,
+            "NBR": nbr_tok,
             "BLOCK": block,
             "SKED": sked,
             "PAY": pay,
             "CREDIT": cred
         })
 
-    if not rows:
+    if not parsed_rows:
         return pd.DataFrame(columns=["DATE","DES","NBR","BLOCK","SKED","PAY","CREDIT"])
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(parsed_rows)
 
-    # Drop duplicates (OCR can sometimes double-read)
+    # drop duplicates, defensive
     df = df.drop_duplicates()
 
-    # Filter out accidental header captures like "DATE DES NBR BLOCK ..."
-    df = df[~df["DATE"].str.contains("DATE", na=False)]
-
+    # final tidy
     df = df.reset_index(drop=True)
-
     return df
 
 def compute_totals(df: pd.DataFrame) -> dict:
-    """
-    Calculate total monthly credit/pay.
-    We prioritize CREDIT. If CREDIT is blank for a row,
-    we fall back to PAY for that row.
-    """
     if df.empty:
         return {
             "total_minutes": 0,
@@ -215,6 +227,7 @@ def compute_totals(df: pd.DataFrame) -> dict:
 
     df_work = df.copy()
 
+    # choose CREDIT if present else PAY
     effective_credit_col = []
     for _, r in df_work.iterrows():
         if r["CREDIT"]:
@@ -236,30 +249,21 @@ def compute_totals(df: pd.DataFrame) -> dict:
         "detail_df": df_work
     }
 
-# =========================
-# Main App Logic
-# =========================
+# ---------- main app ----------
 
 if uploaded_file is None:
     st.info("No file uploaded yet.")
 else:
-    # Open the uploaded screenshot
     img = Image.open(uploaded_file)
 
-    # OCR
     with st.spinner("Reading your timecard..."):
         raw_text_full = ocr_image_to_text(img)
 
-    # Trim OCR text so we only start at MONTHLY TIME DATA
-    raw_text = crop_ocr_to_timecard_section(raw_text_full)
+    trimmed_text = crop_ocr_to_timecard_section(raw_text_full)
 
-    # Parse OCR text -> structured rows
-    df = parse_timecard_lines(raw_text)
-
-    # Compute totals for CREDIT/PAY
+    df = parse_timecard_lines(trimmed_text)
     totals = compute_totals(df)
 
-    # Layout: summary on left, table on right
     left_col, right_col = st.columns([1, 2])
 
     with left_col:
@@ -278,13 +282,12 @@ else:
             hide_index=True
         )
 
-    # Debug / advanced info so we can keep iterating
     with st.expander("Advanced / Debug"):
         st.write("🔎 Raw OCR text (full):")
         st.text(raw_text_full)
 
         st.write("🔎 Trimmed OCR text (starting at 'MONTHLY TIME DATA'):")
-        st.text(raw_text)
+        st.text(trimmed_text)
 
         st.write("Parsed DataFrame with computed minutes:")
         st.dataframe(
