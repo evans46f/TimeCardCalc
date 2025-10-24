@@ -99,17 +99,26 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
       05JUN REG 3210 7:24 10:30 10:30 10:30
       01JUN REG 3554 6:30 TRANS TRANS 10:49 0:13
       28JUN REG 0451 1:35 10:30 10:30 3:23
+      27JUN REG RRPY 5:26
 
     For each row we extract:
-    - date (e.g. 06OCT)
-    - duty (RES or REG)
-    - nbr  (pairing/code, e.g. SCC, 3210, RRPY)
-    - times (all H:MM tokens in the row)
-    - has_credit (True if it looks like a pairing with built-in credit)
-    - pay_time_candidate (if row has NO credit, the big standalone pay time)
-    - pay_only_candidate (if row ends in an "extra bump" value -> PAY ONLY)
+    - date, duty (RES/REG), nbr
+    - times = all H:MM tokens
+    - has_credit: does this row clearly show pairing credit (trip-style credit)?
+                  heuristic: repeated same time 3+ times near end
+    - has_trans: row text contains 'TRANS'
+    - main_pay_candidate: base pay for this day that is NOT already in SUB TTL CREDIT
+      Examples:
+        * RRPY 3:09
+        * RRPY 5:26
+        * ...10:30 10:30 3:23 -> 10:30
+        * We SKIP 10:49 on TRANS rows, and we SKIP 15:45 if it's repeated 3x
+    - bump_pay_candidate: last add-on bump (0:13, 0:38, 3:38, 3:23)
+                          Defined as: if last time is strictly smaller than previous time
 
-    We'll detect credit and pay-only with heuristics.
+    This matches the breakdown you gave:
+      Pay only        = main_pay_candidate sum
+      ADDTL PAY ONLY  = bump_pay_candidate sum
     """
     t = nbps(raw)
 
@@ -133,69 +142,89 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         duty = (m.group("duty") or "").upper()
         nbr  = (m.group("nbr") or "").upper()
         seg  = (m.group(0) or "")
+        tail_text = (m.group("tail") or "")
 
-        # Grab all H:MM-like tokens
+        # all H:MM-ish tokens
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
 
-        # ---------------------------------
-        # Detect if this row has credit
-        # ---------------------------------
-        # We consider it "credit" if near the end you see repeating times
-        # like "10:30 10:30 10:30" or "15:45 15:45 15:45".
+        # detect TRANS explicitly
+        has_trans = "TRANS" in tail_text.upper()
+
+        # detect "has_credit" = repeated same number 3+ times before a small bump
+        # e.g. "15:45 15:45 15:45 0:38", "10:30 10:30 10:30 3:38"
         has_credit = False
-        if len(times) >= 3:
-            last3 = times[-3:]
-            if len(set(last3)) == 1:
+        repeated_credit_value = None
+        if len(times) >= 4:
+            # look at everything except final bump
+            before_last = times[:-1]
+            # check last up to 3 tokens before final
+            last4_main = before_last[-3:]
+            if len(last4_main) == 3 and len(set(last4_main)) == 1:
                 has_credit = True
-        if len(times) >= 4 and not has_credit:
-            # e.g. "... 15:45 15:45 15:45 0:38"
-            last4_main = times[-4:-1]
-            if len(set(last4_main)) == 1:
-                has_credit = True
+                repeated_credit_value = last4_main[0]
 
-        # ---------------------------------
-        # PAY TIME (no CREDIT)
-        # ---------------------------------
-        # If the row does NOT appear to have a credit block,
-        # we treat the last time token as "pay_time_candidate".
-        # Ex: "RRPY 3:09" or "RRPY 5:26".
-        pay_time_candidate = None
-        if not has_credit and times:
-            pay_time_candidate = times[-1]
-
-        # ---------------------------------
-        # PAY ONLY bump detection (NEW RULE)
-        # ---------------------------------
-        # Previously: we only counted the last time if there were >=5 tokens.
-        # Now: If the row has >=2 time tokens, and the LAST time is strictly
-        # smaller than the previous time, we treat that LAST time as a PAY ONLY bump.
-        #
-        # Why: this catches things like:
-        #  - "... 10:49 0:13"
-        #  - "... 10:30 10:30 3:23"
-        #  - "... 15:45 15:45 15:45 0:38"
-        pay_only_candidate = None
+        # next: detect bump_pay_candidate (ADDTL PAY ONLY)
+        # rule: last time < previous time means the last time is a bump
+        bump_pay_candidate = None
         if len(times) >= 2:
-            last_time = times[-1]
             prev_time = times[-2]
+            last_time = times[-1]
+            if to_minutes(last_time) < to_minutes(prev_time):
+                bump_pay_candidate = last_time
 
-            # Convert both to minutes so we can compare
-            last_m  = to_minutes(last_time)
-            prev_m  = to_minutes(prev_time)
+        # detect main_pay_candidate ("Pay only" bucket)
+        # There are two big sources:
+        # - RRPY rows (standalone pay, like "RRPY 3:09")
+        # - rows that end with main_time then a smaller bump (e.g. "10:30 10:30 3:23")
+        #   BUT:
+        #   * if main_time is repeated 3+ times (trip/credit rows) -> skip, already in credit
+        #   * if it's a TRANS row -> skip main_time completely (you told me not to count 10:49)
+        main_pay_candidate = None
 
-            # If the last value is strictly less than the previous,
-            # we consider it an incremental pay-only bump.
+        # Case 1: RRPY row (always take its time)
+        if "RRPY" in nbr:
+            # Usually these are like "RRPY 3:09" (single time)
+            if times:
+                main_pay_candidate = times[-1]
+
+        # Case 2: non-RRPY rows with a "main then bump" shape
+        elif len(times) >= 2:
+            prev_time = times[-2]
+            last_time = times[-1]
+            prev_m = to_minutes(prev_time)
+            last_m = to_minutes(last_time)
+
             if last_m < prev_m:
-                pay_only_candidate = last_time
+                # We have main pay (prev_time) and bump pay (last_time)
+                # We may or may not include prev_time.
+                # We include prev_time as main pay UNLESS:
+                #  - It's a TRANS row, or
+                #  - That prev_time is part of a 3x repeat block (like 15:45 15:45 15:45 ...)
+                #    meaning it's already baked into credit guarantee.
+                if not has_trans:
+                    # count how many times prev_time appeared BEFORE the last one
+                    occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
+                    if not (has_credit and repeated_credit_value == prev_time and len(occurrences_prev_before_last) >= 3):
+                        # Special handling: has_credit will only be True if repeated >=3,
+                        # so essentially:
+                        # - If prev_time shows up 3+ times, skip it, it's already in credit.
+                        # - Else include it.
+                        #
+                        # BUT NOTE: if has_credit==True we *know* prev_time repeated at least 3x,
+                        # so that path won't fire anyway.
+                        # We'll also add an extra explicit guard:
+                        if len(occurrences_prev_before_last) < 3:
+                            main_pay_candidate = prev_time
 
         rows.append({
             "date": date,
             "duty": duty,
             "nbr": nbr,
             "times": times,
-            "has_credit": has_credit,
-            "pay_time_candidate": pay_time_candidate,
-            "pay_only_candidate": pay_only_candidate,
+            "has_credit_block": has_credit,
+            "has_trans": has_trans,
+            "main_pay_candidate": main_pay_candidate,  # goes to "Pay only"
+            "bump_pay_candidate": bump_pay_candidate,  # goes to "ADDTL PAY ONLY"
             "raw": seg.strip(),
         })
 
@@ -223,11 +252,11 @@ def compute_components(raw: str) -> Dict[str, Any]:
     """
     Compute everything we add to get final pay.
 
-    Formula (universal):
+    Formula you just finalized:
       TOTAL PAY =
           SUB TTL CREDIT
-        + PAY TIME rows with NO CREDIT
-        + PAY ONLY bumps
+        + SUM(main_pay_candidate)         (aka "Pay only": RRPY, 10:30 from partial day, etc.)
+        + SUM(bump_pay_candidate)         (aka "ADDTL PAY ONLY": 0:13, 3:38, etc.)
         + G/SLIP PAY
         + REROUTE PAY
         + S/SLIP PAY
@@ -240,33 +269,31 @@ def compute_components(raw: str) -> Dict[str, Any]:
 
     sub_ttl_credit_mins, sub_src = grab_sub_ttl_credit_minutes(raw)
 
-    pay_time_no_credit_mins = 0  # RRPY-style standalone pay time
-    pay_only_mins = 0           # tail bumps like 0:13, 3:38, 3:23, etc.
+    pay_only_main_mins = 0       # sum(main_pay_candidate)
+    pay_only_bump_mins = 0       # sum(bump_pay_candidate)
 
     debug_rows = []
     for r in rows:
-        add_pay_time = 0
-        add_pay_only = 0
+        add_main = 0
+        add_bump = 0
 
-        if r["pay_time_candidate"] and not r["has_credit"]:
-            # ex: REG RRPY 3:09 (no CREDIT block)
-            add_pay_time = to_minutes(r["pay_time_candidate"])
-            pay_time_no_credit_mins += add_pay_time
+        if r["main_pay_candidate"]:
+            add_main = to_minutes(r["main_pay_candidate"])
+            pay_only_main_mins += add_main
 
-        if r["pay_only_candidate"]:
-            # ex: 10:49 0:13  -> add 0:13
-            # ex: ...10:30 10:30 3:23 -> add 3:23
-            add_pay_only = to_minutes(r["pay_only_candidate"])
-            pay_only_mins += add_pay_only
+        if r["bump_pay_candidate"]:
+            add_bump = to_minutes(r["bump_pay_candidate"])
+            pay_only_bump_mins += add_bump
 
         debug_rows.append({
             "Date": r["date"],
             "Duty": r["duty"],
             "NBR": r["nbr"],
             "Times": ", ".join(r["times"]),
-            "Has CREDIT?": "Y" if r["has_credit"] else "N",
-            "PayTime(no CREDIT) added": from_minutes(add_pay_time) if add_pay_time else "",
-            "PayOnly added": from_minutes(add_pay_only) if add_pay_only else "",
+            "Has credit block (3x repeat)?": "Y" if r["has_credit_block"] else "N",
+            "TRANS Row?": "Y" if r["has_trans"] else "N",
+            "Main Pay added (Pay only)": from_minutes(add_main) if add_main else "",
+            "Bump Pay added (ADDTL PAY ONLY)": from_minutes(add_bump) if add_bump else "",
             "Raw Row Snippet": r["raw"][:200],
         })
 
@@ -282,14 +309,17 @@ def compute_components(raw: str) -> Dict[str, Any]:
         "card_type": card_type,
         "sub_ttl_credit_mins": sub_ttl_credit_mins,
         "sub_ttl_src": sub_src,
-        "pay_time_no_credit_mins": pay_time_no_credit_mins,
-        "pay_only_mins": pay_only_mins,
+
+        "pay_only_main_mins": pay_only_main_mins,   # bucket: Pay only
+        "pay_only_bump_mins": pay_only_bump_mins,   # bucket: ADDTL PAY ONLY
+
         "g_slip_pay_mins": g_slip_pay_mins,
         "reroute_pay_mins": reroute_pay_mins,
         "s_slip_pay_mins": s_slip_pay_mins,
         "pbs_pr_pay_mins": pbs_pr_pay_mins,
         "assign_pay_mins": assign_pay_mins,
         "res_assign_gslip_mins": res_assign_gslip_mins,
+
         "debug_rows": debug_rows,
     }
 
@@ -298,16 +328,21 @@ def compute_totals(raw: str) -> Dict[str, Any]:
     Final math:
       TOTAL PAY =
           SUB TTL CREDIT
-        + PAY TIME rows with NO CREDIT
-        + PAY ONLY bumps
-        + all named bottom-line buckets
+        + PAY ONLY (main_pay_candidate)
+        + ADDTL PAY ONLY (bump_pay_candidate)
+        + G/SLIP PAY
+        + REROUTE PAY
+        + S/SLIP PAY
+        + PBS/PR PAY
+        + ASSIGN PAY
+        + RES ASSIGN-G/SLIP PAY
     """
     comps = compute_components(raw)
 
     total_mins = (
         comps["sub_ttl_credit_mins"]
-        + comps["pay_time_no_credit_mins"]
-        + comps["pay_only_mins"]
+        + comps["pay_only_main_mins"]
+        + comps["pay_only_bump_mins"]
         + comps["g_slip_pay_mins"]
         + comps["reroute_pay_mins"]
         + comps["s_slip_pay_mins"]
@@ -327,7 +362,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Paste your Monthly Time Data (lineholder or reserve). I total pay using your contract math.")
+st.caption("Paste your Monthly Time Data. I total pay using the exact buckets you defined (SUB TTL CREDIT + Pay only + ADDTL PAY ONLY + named pays).")
 
 with st.sidebar:
     st.header("Input")
@@ -338,7 +373,7 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve-style with reroute + RES ASSIGN-G/SLIP, expected total ~103:56 under these rules
+    # Reserve-style example, should give ~103:56 under this logic.
     default_text = (
         "MONTHLY TIME DATA 10/23/25 20:37:57 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -353,12 +388,12 @@ if example_btn_res:
         "22OCT RES LOSA 10:00 10:00 "
         "17:51 + 39:43 + 0:00 = 57:34 - 0:00 + 0:00 = 57:34 "
         "G/SLIP PAY : 0:00 ASSIGN PAY: 0:00 RES ASSIGN-G/SLIP PAY: 10:30 "
-        'REROUTE PAY: 10:30 END OF DISPLAY'
+        "REROUTE PAY: 10:30 END OF DISPLAY"
     )
 
 if example_btn_line:
-    # Lineholder-style with TRANS / RRPY / guarantee / g-slip
-    # Should produce ~98:57 under the finalized rules.
+    # Lineholder-style example (the June card),
+    # should return ~109:27 after applying the final logic.
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
@@ -406,15 +441,15 @@ if st.session_state.get("calc"):
 
     st.subheader("Results")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Pay (H:MM)", comps["total_hmm"])
-    c2.metric("Total Pay (Decimal)", f"{comps['total_decimal']:.2f}")
+    c1.metric("TOTAL PAY (H:MM)", comps["total_hmm"])
+    c2.metric("TOTAL PAY (Decimal)", f"{comps['total_decimal']:.2f}")
     c3.metric("Detected Card Type", comps["card_type"])
     c4.metric("SUB TTL Source", comps["sub_ttl_src"])
 
     breakdown_rows = [
         ("SUB TTL CREDIT", from_minutes(comps["sub_ttl_credit_mins"])),
-        ("PAY TIME ROWS (no CREDIT)", from_minutes(comps["pay_time_no_credit_mins"])),
-        ("PAY ONLY bumps", from_minutes(comps["pay_only_mins"])),
+        ("PAY ONLY (main pay)", from_minutes(comps["pay_only_main_mins"])),
+        ("ADDTL PAY ONLY (bumps)", from_minutes(comps["pay_only_bump_mins"])),
         ("G/SLIP PAY", from_minutes(comps["g_slip_pay_mins"])),
         ("REROUTE PAY", from_minutes(comps["reroute_pay_mins"])),
         ("S/SLIP PAY", from_minutes(comps["s_slip_pay_mins"])),
@@ -432,8 +467,8 @@ if st.session_state.get("calc"):
         st.dataframe(dbg, use_container_width=True)
         st.caption(
             "Math = SUB TTL CREDIT "
-            "+ PAY TIME rows with no CREDIT "
-            "+ PAY ONLY bumps "
+            "+ PAY ONLY (main pay rows like RRPY, partial 10:30 days not baked into credit) "
+            "+ ADDTL PAY ONLY (0:13/3:38/etc) "
             "+ G/SLIP / REROUTE / S-SLIP / PBS/PR / ASSIGN / RES ASSIGN-G/SLIP."
         )
 
