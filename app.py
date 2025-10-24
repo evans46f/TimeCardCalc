@@ -33,12 +33,10 @@ def nbps(text: str) -> str:
 
 def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
     """
-    Get the final period credit (SUB TTL CREDIT / TTL CREDIT).
-    We take the LAST '= H:MM' we see on the math line.
-
-    Example line shape:
-      31:34 + 17:57 + 0:00 = 49:31 - 0:00 + 0:00 = 49:31
-    We'll pull 49:31.
+    Get the base period credit (SUB TTL CREDIT / TTL CREDIT BEFORE AWARD).
+    We take the LAST '= H:MM' on the guarantee math line.
+    e.g. "68:34 ... = 68:34 - 0:00 + 3:26 = 72:00"
+    We take 68:34, not 72:00 (72:00 already includes award).
     """
     t = nbps(raw)
     best_val = 0
@@ -47,7 +45,7 @@ def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
         if "=" in line and re.search(r"\d{1,3}:[0-5]\d", line):
             all_eq = list(re.finditer(r"=\s*(\d{1,3}:[0-5]\d)", line))
             if all_eq:
-                mm_str = all_eq[-1].group(1)
+                mm_str = all_eq[0].group(1)  # first subtotal after '='
                 best_val = to_minutes(mm_str)
                 src = "Equation subtotal line"
     return best_val, src
@@ -58,8 +56,7 @@ def extract_numeric_field(raw: str, left_label_regex: str) -> int:
     Extract a single H:MM for 'bank award' style fields like:
       BANK DEP ... AWARD ... 0:00
       TTL BANK ... OPTS AWARD ... 3:26
-
-    We match the label, allow ~40 chars, then grab the first H:MM after.
+    We'll match the label, allow ~40 chars, then grab the first H:MM after.
     """
     t = nbps(raw)
     pat = re.compile(
@@ -75,11 +72,8 @@ def extract_numeric_field(raw: str, left_label_regex: str) -> int:
 def extract_training_pay_minutes(raw: str) -> int:
     """
     Sum any 'DISTRIBUTED TRNG PAY:' lines.
-
-    Example:
       ... DISTRIBUTED TRNG PAY:   1:00
       ... DISTRIBUTED TRNG PAY:   1:29
-
     -> 1:00 + 1:29
     """
     t = nbps(raw)
@@ -149,38 +143,48 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
       - bump_pay_candidate  -> ADDTL PAY ONLY COLUMN
       - debug flags
 
-    MAIN PAY LOGIC (PAY TIME ONLY):
+    PAY TIME ONLY rules:
+
       Rule A: If NBR includes 'RRPY' (RRPY, ADJ-RRPY, etc.),
-              then the last H:MM on that row counts as PAY TIME ONLY.
-              This applies for BOTH RES and REG rows.
-              (e.g. 'ADJ-RRPY 1:53 1:53', 'RRPY 3:09', 'RRPY 5:26')
+              then the LAST H:MM on that row counts as PAY TIME ONLY.
+              Applies to BOTH RES and REG.
+              e.g. "ADJ-RRPY 1:53 1:53", "RRPY 3:09", "RRPY 5:26"
 
-      Rule B: Otherwise, RES rows can generate PAY TIME ONLY if ALL are true:
-        - there's NO pairing credit block (like 10:30 10:30 10:30 ...)
-        - ALL the H:MM times on that row are IDENTICAL
-          (e.g. '15:00 15:00', '1:00 1:00', '6:33 6:33', '32:05 32:05')
-        - NBR is NOT "SICK"
-        - NBR is NOT "TOFF"
-        - the row text does NOT contain "TRANS"
-        This covers SCC / LOSA / PVEL / 20WD / VAC / LOSA / PVEL / 4F1C, etc.
-        We EXCLUDE SICK, TOFF, TRANS because those shouldn't stack.
+      Rule B: RES flat-pay guarantee style:
+        duty == RES
+        not has_credit_block
+        all times on that row are IDENTICAL
+        NBR not in {"SICK","TOFF"}
+        row doesn't contain "TRANS"
+        → take that time as PAY TIME ONLY
+        (covers SCC, LOSA, PVEL, 20WD, VAC, PVEL, 4F1C, etc.)
+        We EXCLUDE SICK, TOFF, TRANS because you said don't stack those.
 
-      Rule C: REG rows (lineholder add-on days like '44WD 10:00'):
-        If duty == 'REG'
-        AND row has EXACTLY ONE time value total
-        AND it's not a TRANS row
-        => that one time counts as PAY TIME ONLY.
-        This is how we count a lone 10:00 line that isn't in SUB TTL CREDIT.
+      Rule C: REG single-pay guarantee style:
+        duty == REG
+        not has_trans
+        len(times) == 1
+        → that single time is PAY TIME ONLY
+        (covers things like "44WD 10:00")
 
-      We do NOT grab pairing credit values like 15:45 or 26:15 again; those
-      are already in SUB TTL CREDIT (guarantee/credit line).
+      Rule D: REG partial-credit-with-tail style (your 28JUN case):
+        duty == REG
+        not has_trans
+        not has_credit_block  (so NOT the classic 10:30 10:30 10:30 3:38 block)
+        len(times) >= 3
+        the row has a "tail" we already classify as bump_pay_candidate
+        → treat the SECOND-TO-LAST time as PAY TIME ONLY
+        (ex: "1:35 10:30 10:30 3:23" -> PAY TIME ONLY = 10:30, bump = 3:23)
 
-    BUMP PAY LOGIC (ADDTL PAY ONLY COLUMN):
-      We take the last time on the row as bump pay ONLY IF:
-        - there are at least 2 times on that row
-        - the last time is strictly smaller than the one before it
-        - AND the last time is NOT equal to the first time on the row
-          (this prevents counting patterns like '8:03 ... 8:03' as an add-on).
+    ADDTL PAY ONLY rules (bump pay):
+      If len(times) >= 2 and
+         last_time < prev_time (in minutes) and
+         last_time != first_time on the row:
+        → last_time is ADDTL PAY ONLY for that row
+      (covers 0:13, 0:38, 3:38, 3:23, etc.)
+
+    We do NOT also treat normal pairing block credit (like
+    10:30 10:30 10:30 0:07) as PAY TIME ONLY, because it's already in subtotal.
     """
     t = nbps(raw)
 
@@ -209,10 +213,11 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # All H:MM tokens on this row:
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # TRANS?
+        # Is this row marked TRANS?
         has_trans = "TRANS" in tail_text.upper()
 
-        # Pairing credit block? e.g. "10:30 10:30 10:30 0:07"
+        # pairing credit block?
+        # e.g. "10:30 10:30 10:30 0:07" (triple repeat before final tail)
         has_credit_block = False
         if len(times) >= 4:
             before_last = times[:-1]
@@ -227,18 +232,18 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             last_time = times[-1]
             prev_m = to_minutes(prev_time)
             last_m = to_minutes(last_time)
-            # only count real little bumps like 0:07, 1:22, 0:13, 3:38, etc.
+            # only count real little tails (like 0:13, 0:38, 3:38, 3:23)
             if last_m < prev_m and last_time != times[0]:
                 bump_pay_candidate = last_time
 
-        # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
+        # PAY TIME ONLY candidate
         main_pay_candidate = None
 
-        # Rule A: ANY RRPY (RES or REG). Take last time on row.
+        # Rule A: any RRPY => last time is PAY TIME ONLY
         if "RRPY" in nbr and times:
             main_pay_candidate = times[-1]
 
-        # Rule B: RES flat-pay style SCC / LOSA / PVEL / 20WD / VAC / etc.
+        # Rule B: RES flat-pay (SCC/LOSA/PVEL/etc.), excluding SICK/TOFF/TRANS
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 unique_times = set(times)
@@ -247,15 +252,33 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                     and nbr not in ("SICK", "TOFF")
                     and not has_trans
                 ):
-                    # ex: "LOSA 15:00 15:00", "SCC 1:00 1:00", "PVEL 10:00 10:00"
                     main_pay_candidate = times[-1]
 
-        # Rule C: REG single-pay add-on day ("44WD 10:00")
+        # Rule C: REG single-pay (like "44WD 10:00")
         if main_pay_candidate is None:
             if duty == "REG" and times and not has_trans:
                 if len(times) == 1:
-                    # e.g. "07OCT REG 44WD 10:00"
                     main_pay_candidate = times[0]
+
+        # Rule D: REG partial-credit-with-tail ("... 10:30 10:30 3:23")
+        # conditions:
+        #   - REG
+        #   - not has_trans
+        #   - not has_credit_block (so it's not a 3x repeat trip credit)
+        #   - len(times) >= 3
+        #   - there's a bump tail
+        #   - then second-to-last time is PAY TIME ONLY
+        if main_pay_candidate is None:
+            if (
+                duty == "REG"
+                and times
+                and not has_trans
+                and not has_credit_block
+                and len(times) >= 3
+                and bump_pay_candidate is not None
+            ):
+                # second-to-last time
+                main_pay_candidate = times[-2]
 
         rows.append({
             "date": date,
@@ -301,10 +324,8 @@ def compute_components(raw: str) -> Dict[str, Any]:
 
     sub_ttl_credit_mins, sub_src = grab_sub_ttl_credit_minutes(raw)
 
-    # PAY TIME ONLY (PAY NO CREDIT)
-    pay_only_main_mins = 0
-    # ADDTL PAY ONLY COLUMN
-    pay_only_bump_mins = 0
+    pay_only_main_mins = 0   # PAY TIME ONLY
+    pay_only_bump_mins = 0   # ADDTL PAY ONLY
 
     debug_rows = []
     for r in rows:
@@ -385,8 +406,8 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         + comps["training_pay_mins"]
     )
 
-    # Reserve includes RES ASSIGN-G/SLIP PAY (not G/SLIP PAY)
-    # Lineholder includes G/SLIP PAY (not RES ASSIGN-G/SLIP PAY)
+    # Reserve includes RES ASSIGN-G/SLIP PAY
+    # Lineholder includes G/SLIP PAY
     if ct == "RESERVE":
         total_mins = base_mins + comps["res_assign_gslip_mins"]
     else:
@@ -421,7 +442,6 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve-ish anonymized example
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -442,7 +462,6 @@ if example_btn_res:
     )
 
 if example_btn_line:
-    # Lineholder-ish anonymized example
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
@@ -459,8 +478,6 @@ if example_btn_line:
         "68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 "
         "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 3:26 "
         "G/SLIP PAY : 10:30 REROUTE PAY: 0:00 ASSIGN PAY: 0:00 "
-        "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
-        "14JUL25 QC11 DISTRIBUTED TRNG PAY: 1:29 "
         "END OF DISPLAY"
     )
 
@@ -473,7 +490,7 @@ elif default_text:
 if "calc" not in st.session_state:
     st.session_state["calc"] = False
 
-# textarea for paste
+# textarea
 st.text_area(
     "Paste your timecard text here:",
     key="timecard_text",
