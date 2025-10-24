@@ -34,9 +34,9 @@ def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
     """
     Get the SUB TTL CREDIT / final period credit from the math block.
     We take the LAST '= H:MM' found on any math-ish line.
-    Example line:
+    Example:
       68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
-    -> returns 72:00 (4320 min)
+    -> returns 72:00
     """
     t = nbps(raw)
     best_val = 0
@@ -54,29 +54,36 @@ def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
 # Parsing helpers for named pay buckets at the bottom
 # ======================================================
 
+def _label_to_regex(lbl: str) -> str:
+    """
+    Turn a label like "G/SLIP PAY" or "ASSIGN PAY" into a loose matcher:
+    "G/SLIP\s+PAY"
+    We escape each word and join with \s+ so weird spacing still matches.
+    """
+    parts = re.split(r"\s+", lbl.strip())
+    esc = [re.escape(p) for p in parts]
+    return r"\s+".join(esc)
+
 def extract_named_bucket(text: str, labels: List[str]) -> int:
     """
     Extract values like:
-      REROUTE PAY: 10:30
-      ASSIGN PAY: 0:00
       G/SLIP PAY : 10:30
-    Whitespace and punctuation (/,-) are made flexible.
+      ASSIGN PAY: 0:00
+      REROUTE PAY: 0:00
+    This version fixes the old regex bug so G/SLIP PAY is no longer missed.
     """
     t = nbps(text)
     for lbl in labels:
-        # make interior whitespace flexible
-        pattern = re.sub(r"\s+", r"\\s+", lbl)
-        # escape /, \, -
-        pattern = re.sub(r"([/\\-])", r"\\\1", pattern)
-        m = re.search(pattern + r"\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
+        pattern = _label_to_regex(lbl) + r"\s*:\s*(\d{1,3}:[0-5]\d)"
+        m = re.search(pattern, t, flags=re.I)
         if m:
             return to_minutes(m.group(1))
     return 0
 
 def extract_res_assign_gslip_bucket(text: str) -> int:
     """
-    Special-case parser for 'RES ASSIGN-G/SLIP PAY:' or 'RES ASSIGN G/SLIP PAY:'.
-    Very flexible around the hyphen and the space after G/.
+    Special-case parser for "RES ASSIGN-G/SLIP PAY:" / "RES ASSIGN G/SLIP PAY:"
+    Very flexible around the hyphen and slash spacing.
     """
     t = nbps(text)
     m = re.search(
@@ -94,31 +101,21 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 
 def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     """
-    Parse each duty day row like:
-      06OCT RES SCC 1:00 1:00
-      05JUN REG 3210 7:24 10:30 10:30 10:30
-      01JUN REG 3554 6:30 TRANS TRANS 10:49 0:13
-      28JUN REG 0451 1:35 10:30 10:30 3:23
-      27JUN REG RRPY 5:26
+    Parse each duty day row and identify:
+    - main_pay_candidate  (goes in "Pay only")
+    - bump_pay_candidate  (goes in "ADDTL PAY ONLY")
 
-    For each row we extract:
-    - date, duty (RES/REG), nbr
-    - times = all H:MM tokens
-    - has_credit: does this row clearly show pairing credit (trip-style credit)?
-                  heuristic: repeated same time 3+ times near end
-    - has_trans: row text contains 'TRANS'
-    - main_pay_candidate: base pay for this day that is NOT already in SUB TTL CREDIT
-      Examples:
-        * RRPY 3:09
-        * RRPY 5:26
-        * ...10:30 10:30 3:23 -> 10:30
-        * We SKIP 10:49 on TRANS rows, and we SKIP 15:45 if it's repeated 3x
-    - bump_pay_candidate: last add-on bump (0:13, 0:38, 3:38, 3:23)
-                          Defined as: if last time is strictly smaller than previous time
-
-    This matches the breakdown you gave:
-      Pay only        = main_pay_candidate sum
-      ADDTL PAY ONLY  = bump_pay_candidate sum
+    Rules (from your contract math):
+    - RRPY rows (e.g. "RRPY 3:09") are main pay.
+    - Rows that end with a smaller time than the one before it, like
+      "... 10:30 10:30 3:23" or "10:49 0:13", split into:
+        * that "before" time = main pay (unless it's a TRANS row
+          or a 3x repeated pairing credit),
+        * the last/lower time = bump pay.
+    - If the repeated time shows up 3+ times (10:30 10:30 10:30 3:38),
+      it's already covered in credit, so don't count that main time again.
+    - TRANS rows: we do NOT add their main time as main pay (e.g. don't add 10:49),
+      but we DO add the bump (0:13).
     """
     t = nbps(raw)
 
@@ -144,50 +141,39 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         seg  = (m.group(0) or "")
         tail_text = (m.group("tail") or "")
 
-        # all H:MM-ish tokens
+        # pull all H:MM tokens off the row
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
 
         # detect TRANS explicitly
         has_trans = "TRANS" in tail_text.upper()
 
-        # detect "has_credit" = repeated same number 3+ times before a small bump
-        # e.g. "15:45 15:45 15:45 0:38", "10:30 10:30 10:30 3:38"
-        has_credit = False
+        # detect if there's a 3x repeated credit block like "10:30 10:30 10:30"
+        has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
-            # look at everything except final bump
             before_last = times[:-1]
-            # check last up to 3 tokens before final
-            last4_main = before_last[-3:]
-            if len(last4_main) == 3 and len(set(last4_main)) == 1:
-                has_credit = True
-                repeated_credit_value = last4_main[0]
+            last3 = before_last[-3:]
+            if len(last3) == 3 and len(set(last3)) == 1:
+                has_credit_block = True
+                repeated_credit_value = last3[0]
 
-        # next: detect bump_pay_candidate (ADDTL PAY ONLY)
-        # rule: last time < previous time means the last time is a bump
+        # figure out bump_pay_candidate (ADDTL PAY ONLY)
         bump_pay_candidate = None
         if len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
             if to_minutes(last_time) < to_minutes(prev_time):
-                bump_pay_candidate = last_time
+                bump_pay_candidate = last_time  # e.g. 0:13, 3:23, 3:38, etc.
 
-        # detect main_pay_candidate ("Pay only" bucket)
-        # There are two big sources:
-        # - RRPY rows (standalone pay, like "RRPY 3:09")
-        # - rows that end with main_time then a smaller bump (e.g. "10:30 10:30 3:23")
-        #   BUT:
-        #   * if main_time is repeated 3+ times (trip/credit rows) -> skip, already in credit
-        #   * if it's a TRANS row -> skip main_time completely (you told me not to count 10:49)
+        # figure out main_pay_candidate (PAY ONLY)
         main_pay_candidate = None
 
-        # Case 1: RRPY row (always take its time)
+        # Case 1: RRPY style (standalone pay)
         if "RRPY" in nbr:
-            # Usually these are like "RRPY 3:09" (single time)
             if times:
                 main_pay_candidate = times[-1]
 
-        # Case 2: non-RRPY rows with a "main then bump" shape
+        # Case 2: row ends with main then smaller bump
         elif len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
@@ -195,36 +181,35 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             last_m = to_minutes(last_time)
 
             if last_m < prev_m:
-                # We have main pay (prev_time) and bump pay (last_time)
-                # We may or may not include prev_time.
+                # We have a "main then bump" pattern.
                 # We include prev_time as main pay UNLESS:
-                #  - It's a TRANS row, or
-                #  - That prev_time is part of a 3x repeat block (like 15:45 15:45 15:45 ...)
-                #    meaning it's already baked into credit guarantee.
+                #  - it's a TRANS row (don't count the main time like 10:49),
+                #  - OR that prev_time is clearly pairing credit repeated 3+ times
+                #    (10:30 10:30 10:30 ...).
                 if not has_trans:
-                    # count how many times prev_time appeared BEFORE the last one
+                    # Count occurrences of prev_time before the final bump.
                     occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
-                    if not (has_credit and repeated_credit_value == prev_time and len(occurrences_prev_before_last) >= 3):
-                        # Special handling: has_credit will only be True if repeated >=3,
-                        # so essentially:
-                        # - If prev_time shows up 3+ times, skip it, it's already in credit.
-                        # - Else include it.
-                        #
-                        # BUT NOTE: if has_credit==True we *know* prev_time repeated at least 3x,
-                        # so that path won't fire anyway.
-                        # We'll also add an extra explicit guard:
-                        if len(occurrences_prev_before_last) < 3:
-                            main_pay_candidate = prev_time
+
+                    # If the row had a credit block and this prev_time was the repeated credit value,
+                    # we skip it (already paid in credit).
+                    repeated_block = (
+                        has_credit_block
+                        and repeated_credit_value == prev_time
+                        and len(occurrences_prev_before_last) >= 3
+                    )
+
+                    if not repeated_block:
+                        main_pay_candidate = prev_time
 
         rows.append({
             "date": date,
             "duty": duty,
             "nbr": nbr,
             "times": times,
-            "has_credit_block": has_credit,
+            "has_credit_block": has_credit_block,
             "has_trans": has_trans,
-            "main_pay_candidate": main_pay_candidate,  # goes to "Pay only"
-            "bump_pay_candidate": bump_pay_candidate,  # goes to "ADDTL PAY ONLY"
+            "main_pay_candidate": main_pay_candidate,   # goes to "Pay only"
+            "bump_pay_candidate": bump_pay_candidate,   # goes to "ADDTL PAY ONLY"
             "raw": seg.strip(),
         })
 
@@ -232,10 +217,8 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
 
 def detect_card_type(rows: List[Dict[str, Any]]) -> str:
     """
-    We still expose what kind of card we THINK this is (lineholder vs reserve),
-    just for UI/debug clarity. (It no longer changes the math.)
-    Rule:
-      - If we saw REG rows and no RES rows -> LINEHOLDER
+    We show card type in UI just for info (doesn't change math):
+      - If there are REG rows and no RES rows -> LINEHOLDER
       - Otherwise -> RESERVE
     """
     saw_res = any(r["duty"] == "RES" for r in rows)
@@ -250,27 +233,24 @@ def detect_card_type(rows: List[Dict[str, Any]]) -> str:
 
 def compute_components(raw: str) -> Dict[str, Any]:
     """
-    Compute everything we add to get final pay.
-
-    Formula you just finalized:
-      TOTAL PAY =
-          SUB TTL CREDIT
-        + SUM(main_pay_candidate)         (aka "Pay only": RRPY, 10:30 from partial day, etc.)
-        + SUM(bump_pay_candidate)         (aka "ADDTL PAY ONLY": 0:13, 3:38, etc.)
-        + G/SLIP PAY
-        + REROUTE PAY
-        + S/SLIP PAY
-        + PBS/PR PAY
-        + ASSIGN PAY
-        + RES ASSIGN-G/SLIP PAY
+    Final buckets:
+      SUB TTL CREDIT
+      PAY ONLY (sum of main_pay_candidate)
+      ADDTL PAY ONLY (sum of bump_pay_candidate)
+      G/SLIP PAY
+      REROUTE PAY
+      S/SLIP PAY
+      PBS/PR PAY
+      ASSIGN PAY
+      RES ASSIGN-G/SLIP PAY
     """
     rows = parse_duty_rows(raw)
     card_type = detect_card_type(rows)
 
     sub_ttl_credit_mins, sub_src = grab_sub_ttl_credit_minutes(raw)
 
-    pay_only_main_mins = 0       # sum(main_pay_candidate)
-    pay_only_bump_mins = 0       # sum(bump_pay_candidate)
+    pay_only_main_mins = 0     # sum(main_pay_candidate)
+    pay_only_bump_mins = 0     # sum(bump_pay_candidate)
 
     debug_rows = []
     for r in rows:
@@ -297,7 +277,7 @@ def compute_components(raw: str) -> Dict[str, Any]:
             "Raw Row Snippet": r["raw"][:200],
         })
 
-    # Named buckets (always added)
+    # Named pay buckets at the bottom
     g_slip_pay_mins       = extract_named_bucket(raw, ["G/SLIP PAY", "G SLIP PAY", "G - SLIP PAY"])
     reroute_pay_mins      = extract_named_bucket(raw, ["REROUTE PAY"])
     s_slip_pay_mins       = extract_named_bucket(raw, ["S/SLIP PAY", "S SLIP PAY", "S - SLIP PAY"])
@@ -310,8 +290,8 @@ def compute_components(raw: str) -> Dict[str, Any]:
         "sub_ttl_credit_mins": sub_ttl_credit_mins,
         "sub_ttl_src": sub_src,
 
-        "pay_only_main_mins": pay_only_main_mins,   # bucket: Pay only
-        "pay_only_bump_mins": pay_only_bump_mins,   # bucket: ADDTL PAY ONLY
+        "pay_only_main_mins": pay_only_main_mins,   # "Pay only"
+        "pay_only_bump_mins": pay_only_bump_mins,   # "ADDTL PAY ONLY"
 
         "g_slip_pay_mins": g_slip_pay_mins,
         "reroute_pay_mins": reroute_pay_mins,
@@ -325,17 +305,16 @@ def compute_components(raw: str) -> Dict[str, Any]:
 
 def compute_totals(raw: str) -> Dict[str, Any]:
     """
-    Final math:
-      TOTAL PAY =
-          SUB TTL CREDIT
-        + PAY ONLY (main_pay_candidate)
-        + ADDTL PAY ONLY (bump_pay_candidate)
-        + G/SLIP PAY
-        + REROUTE PAY
-        + S/SLIP PAY
-        + PBS/PR PAY
-        + ASSIGN PAY
-        + RES ASSIGN-G/SLIP PAY
+    TOTAL PAY =
+        SUB TTL CREDIT
+      + PAY ONLY (main pay)
+      + ADDTL PAY ONLY (bump pay)
+      + G/SLIP PAY
+      + REROUTE PAY
+      + S/SLIP PAY
+      + PBS/PR PAY
+      + ASSIGN PAY
+      + RES ASSIGN-G/SLIP PAY
     """
     comps = compute_components(raw)
 
@@ -362,7 +341,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Paste your Monthly Time Data. I total pay using the exact buckets you defined (SUB TTL CREDIT + Pay only + ADDTL PAY ONLY + named pays).")
+st.caption("Paste Monthly Time Data. Total pay = SUB TTL CREDIT + Pay only + ADDTL PAY ONLY + named pays (G/SLIP, etc).")
 
 with st.sidebar:
     st.header("Input")
@@ -373,7 +352,7 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve-style example, should give ~103:56 under this logic.
+    # Reserve-style example (~103:56 total with this math)
     default_text = (
         "MONTHLY TIME DATA 10/23/25 20:37:57 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -392,8 +371,8 @@ if example_btn_res:
     )
 
 if example_btn_line:
-    # Lineholder-style example (the June card),
-    # should return ~109:27 after applying the final logic.
+    # Lineholder-style example (your June card),
+    # should return ~109:27 now that G/SLIP PAY is actually included.
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
@@ -408,7 +387,9 @@ if example_btn_line:
         "27JUN REG RRPY 5:26 "
         "28JUN REG 0451 1:35 10:30 10:30 3:23 "
         "68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 "
-        "G/SLIP PAY : 10:30 REROUTE PAY: 0:00 END OF DISPLAY"
+        "G/SLIP PAY : 10:30 ASSIGN PAY: 0:00 REROUTE PAY: 0:00 "
+        "RES ASSIGN-G/SLIP PAY: 0:00 S/SLIP PAY : 0:00 PBS/PR PAY : 0:00 "
+        "END OF DISPLAY"
     )
 
 text_value = ""
@@ -467,9 +448,9 @@ if st.session_state.get("calc"):
         st.dataframe(dbg, use_container_width=True)
         st.caption(
             "Math = SUB TTL CREDIT "
-            "+ PAY ONLY (main pay rows like RRPY, partial 10:30 days not baked into credit) "
-            "+ ADDTL PAY ONLY (0:13/3:38/etc) "
-            "+ G/SLIP / REROUTE / S-SLIP / PBS/PR / ASSIGN / RES ASSIGN-G/SLIP."
+            "+ PAY ONLY (main pay like RRPY / standalone partial days) "
+            "+ ADDTL PAY ONLY (0:13 / 3:38 / etc.) "
+            "+ all named buckets (G/SLIP, REROUTE, ASSIGN, etc.)."
         )
 
 st.caption("No data stored. All calculations are done locally in your browser session.")
