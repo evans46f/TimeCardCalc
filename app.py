@@ -181,9 +181,20 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         assign = extract_named_bucket(raw, ["ASSIGN PAY"])
         gslip = extract_named_bucket(raw, ["G/SLIP PAY"])
         total = ttl_credit + pay_only + addtl_only + reroute + assign + gslip
+
         return {
             "card_type": "LINEHOLDER",
             "TTL CREDIT": from_minutes(ttl_credit),
             "PAY TIME ONLY (PAY NO CREDIT)": from_minutes(pay_only),
             "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only),
-            "REROUTE PAY": fr
+            "REROUTE PAY": from_minutes(reroute),
+            "ASSIGN PAY": from_minutes(assign),
+            "G/SLIP PAY": from_minutes(gslip),
+            "TOTAL": from_minutes(total),
+            "debug_rows": build_lineholder_debug_rows(rows),
+        }
+
+    else:
+        data = compute_reserve_total(raw)
+        data["card_type"] = "RESERVE"
+        return data
