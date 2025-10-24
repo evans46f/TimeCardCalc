@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 
 # ======================================================
-# Helpers
+# Basic helpers
 # ======================================================
 
 def to_minutes(s: str) -> int:
@@ -20,17 +20,21 @@ def from_minutes(mins: int) -> str:
     h, m = divmod(mins, 60)
     return f"{h}:{m:02d}"
 
-def clean(text: str) -> str:
-    return (text or "").replace("\u00A0", " ")
+def clean(t: str) -> str:
+    return (t or "").replace("\u00A0", " ")
 
 # ======================================================
-# Card type detection
+# Detect Card Type
 # ======================================================
 
 def detect_card_type(raw: str) -> str:
+    """
+    Decide RESERVE vs LINEHOLDER by looking at actual duty rows.
+    """
     t = clean(raw).upper()
     saw_res_row = re.search(r"\b\d{2}[A-Z]{3}\s+RES\b", t) is not None
     saw_reg_row = re.search(r"\b\d{2}[A-Z]{3}\s+REG\b", t) is not None
+
     if saw_res_row and not saw_reg_row:
         return "RESERVE"
     if saw_reg_row and not saw_res_row:
@@ -40,61 +44,71 @@ def detect_card_type(raw: str) -> str:
     return "RESERVE"
 
 # ======================================================
-# Lineholder parsing and rules
+# Duty Row Parser
 # ======================================================
 
 def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
+    t = clean(raw)
+    seg_re = re.compile(
+        r"(?P<date>\d{2}[A-Z]{3})\s+REG\s+(?P<nbr>[A-Z0-9/-]+)(?P<tail>.*?)(?="
+        r"\d{2}[A-Z]{3}\s+REG\b|END OF DISPLAY|$)",
+        re.I | re.S,
+    )
+
     rows = []
-    for line in clean(raw).splitlines():
-        line_up = line.upper().strip()
-        m = re.match(r"^(\d{2}[A-Z]{3})\s+REG\s+(\S+)\s+(.*)$", line_up)
-        if not m:
-            continue
-        date, nbr, rest = m.groups()
-        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", line_up)
-        has_trans = "TRANS" in line_up
+    for m in seg_re.finditer(t):
+        seg_full = m.group(0)
+        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
         rows.append({
-            "date": date, "nbr": nbr, "times": times,
-            "has_trans": has_trans, "raw": line.strip()
+            "date": (m.group("date") or "").upper(),
+            "nbr": (m.group("nbr") or "").upper(),
+            "times": times,
+            "raw": seg_full.strip(),
         })
     return rows
 
+# ======================================================
+# Numeric extractors
+# ======================================================
+
+def extract_named_bucket(text: str, labels: List[str]) -> int:
+    t = clean(text)
+    for lbl in labels:
+        pattern = re.escape(lbl) + r"\s*[:]\s*([0-9]{1,3}:[0-5][0-9])"
+        m = re.search(pattern, t, re.I)
+        if m:
+            return to_minutes(m.group(1))
+    return 0
+
+def grab_sub_ttl_credit_minutes(raw: str) -> int:
+    """
+    Parse final total credit from guarantee math line.
+    """
+    t = clean(raw)
+    eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
+    if eq_times:
+        return to_minutes(eq_times[-1])
+    return 0
+
+# ======================================================
+# Pay logic – Lineholder
+# ======================================================
+
 def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
+    """
+    Include a REG row only if that line has exactly ONE time value.
+    """
     total = 0
     for r in rows:
         times = r["times"]
-
-        # RRPY rule
-        if "RRPY" in r["nbr"] and times:
-            total += to_minutes(times[-1])
-            continue
-
-        # Single-pay guarantee (e.g. 44WD 10:00)
-        if (not r["has_trans"]) and len(times) == 1:
+        if len(times) == 1:
             total += to_minutes(times[0])
-            continue
-
-        # Short-day min guarantee (bump tail, appears twice)
-        if (not r["has_trans"]) and len(times) >= 3:
-            prev_last_str = times[-2]
-            prev_last = to_minutes(prev_last_str)
-            last = to_minutes(times[-1])
-            if last < prev_last:
-                cnt_prev_last = times.count(prev_last_str)
-                if cnt_prev_last == 2:
-                    total += prev_last
-                    continue
-
-        # NEW: identical last-two-times rule (e.g. 3:31 5:15 5:15)
-        if (not r["has_trans"]) and len(times) >= 2:
-            if times[-1] == times[-2]:
-                total += to_minutes(times[-1])
-                continue
-
     return total
 
-
 def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
+    """
+    ADDTL PAY ONLY COLUMN: if last time < previous time.
+    """
     total = 0
     for r in rows:
         times = r["times"]
@@ -105,104 +119,93 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
                 total += last
     return total
 
-def build_lineholder_debug_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for r in rows:
-        times = r["times"]
-        pay_only_add, addtl_only_add = "", ""
-        if "RRPY" in r["nbr"] and times:
-            pay_only_add = from_minutes(to_minutes(times[-1]))
-        elif (not r["has_trans"]) and len(times) == 1:
-            pay_only_add = from_minutes(to_minutes(times[0]))
-        elif (not r["has_trans"]) and len(times) >= 3:
-            prev_last_str = times[-2]
-            prev_last = to_minutes(prev_last_str)
-            last = to_minutes(times[-1])
-            if last < prev_last:
-                if times.count(prev_last_str) == 2:
-                    pay_only_add = from_minutes(prev_last)
-        if len(times) >= 2:
-            prev_last = to_minutes(times[-2])
-            last = to_minutes(times[-1])
-            if last < prev_last:
-                addtl_only_add = from_minutes(last)
-        out.append({
-            "Date": r["date"], "NBR": r["nbr"],
-            "TRANS row?": "Y" if r["has_trans"] else "N",
-            "All Times": ", ".join(times),
-            "Counted PAY TIME ONLY": pay_only_add,
-            "Counted ADDTL PAY ONLY": addtl_only_add,
-            "Raw Line": r["raw"][:200],
-        })
-    return out
-
 # ======================================================
-# Reserve parsing and rules (simplified)
+# Reserve total logic
 # ======================================================
-
-def extract_named_bucket(text: str, labels: List[str]) -> int:
-    t = clean(text)
-    for lbl in labels:
-        pattern = re.escape(lbl) + r"\s*[:=]\s*(\d{1,3}:[0-5]\d)"
-        m = re.search(pattern, t, flags=re.I)
-        if m:
-            return to_minutes(m.group(1))
-    return 0
-
-def grab_sub_ttl_credit_minutes(raw: str) -> int:
-    t = clean(raw)
-    m = re.search(r"SUB\s+TTL\s+CREDIT.*?=\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
-    if m:
-        return to_minutes(m.group(1))
-    return 0
 
 def compute_reserve_total(raw: str) -> Dict[str, Any]:
-    sub_ttl = grab_sub_ttl_credit_minutes(raw)
-    pay_time_lines = re.findall(r"\bRES\s+\S+\s+(?:\S+\s+){0,6}?(\d{1,3}:[0-5]\d)\s+\1\b", clean(raw))
-    pay_time_only = sum(to_minutes(x) for x in pay_time_lines)
-    res_assign_gslip = extract_named_bucket(raw, ["RES ASSIGN-G/SLIP PAY"])
-    reroute = extract_named_bucket(raw, ["REROUTE PAY"])
-    assign = extract_named_bucket(raw, ["ASSIGN PAY"])
-    bank_dep = extract_named_bucket(raw, ["BANK DEP AWARD"])
-    ttl_bank = extract_named_bucket(raw, ["TTL BANK OPTS AWARD"])
-    total = sub_ttl + pay_time_only + reroute + assign + res_assign_gslip + bank_dep + ttl_bank
+    t = clean(raw)
+
+    def find_minutes(label: str) -> int:
+        m = re.search(rf"{label}\s*[:]\s*([0-9]{{1,3}}:[0-5][0-9])", t, re.I)
+        return to_minutes(m.group(1)) if m else 0
+
+    sub_ttl = grab_sub_ttl_credit_minutes(t)
+    pay_time_only = sum(to_minutes(x) for x in re.findall(r"\b(\d{1,3}:[0-5]\d)\b", t.split("PAY TIME ONLY")[-1])) if "PAY TIME ONLY" in t else 0
+    addtl_only = sum(to_minutes(x) for x in re.findall(r"\b(\d{1,3}:[0-5]\d)\b", t.split("ADDTL PAY ONLY")[-1])) if "ADDTL PAY ONLY" in t else 0
+    reroute = find_minutes("REROUTE PAY")
+    assign = find_minutes("ASSIGN PAY")
+    res_assign = find_minutes("RES ASSIGN-G/SLIP PAY")
+    bank_dep = find_minutes("BANK DEP AWARD")
+    ttl_bank = find_minutes("TTL BANK OPTS AWARD")
+
+    total = sub_ttl + pay_time_only + addtl_only + reroute + assign + res_assign + bank_dep + ttl_bank
+
     return {
         "TTL CREDIT": from_minutes(sub_ttl),
-        "PAY TIME ONLY (PAY NO CREDIT)": from_minutes(pay_time_only),
+        "PAY TIME ONLY": from_minutes(pay_time_only),
+        "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only),
         "REROUTE PAY": from_minutes(reroute),
         "ASSIGN PAY": from_minutes(assign),
-        "RES ASSIGN-G/SLIP PAY": from_minutes(res_assign_gslip),
+        "RES ASSIGN-G/SLIP PAY": from_minutes(res_assign),
         "BANK DEP AWARD": from_minutes(bank_dep),
         "TTL BANK OPTS AWARD": from_minutes(ttl_bank),
         "TOTAL": from_minutes(total),
     }
 
 # ======================================================
-# Compute totals (combined)
+# Compute Totals
 # ======================================================
 
 def compute_totals(raw: str) -> Dict[str, Any]:
     card_type = detect_card_type(raw)
+
     if card_type == "LINEHOLDER":
         rows = parse_lineholder_rows(raw)
-        ttl_credit = grab_sub_ttl_credit_minutes(raw)
-        pay_only = calc_pay_time_only_lineholder(rows)
-        addtl_only = calc_addtl_pay_only_lineholder(rows)
-        reroute = extract_named_bucket(raw, ["REROUTE PAY"])
-        assign = extract_named_bucket(raw, ["ASSIGN PAY"])
-        gslip = extract_named_bucket(raw, ["G/SLIP PAY"])
-        total = ttl_credit + pay_only + addtl_only + reroute + assign + gslip
+
+        ttl_credit_mins = grab_sub_ttl_credit_minutes(raw)
+        pay_only_mins = calc_pay_time_only_lineholder(rows)
+        addtl_only_mins = calc_addtl_pay_only_lineholder(rows)
+
+        gslip_mins = extract_named_bucket(raw, ["G/SLIP PAY"])
+        assign_mins = extract_named_bucket(raw, ["ASSIGN PAY"])
+
+        gslip_twice_mins = 2 * gslip_mins
+        assign_twice_mins = 2 * assign_mins
+
+        total_mins = (
+            ttl_credit_mins
+            + pay_only_mins
+            + addtl_only_mins
+            + gslip_twice_mins
+            + assign_twice_mins
+        )
+
         return {
             "card_type": "LINEHOLDER",
-            "TTL CREDIT": from_minutes(ttl_credit),
-            "PAY TIME ONLY (PAY NO CREDIT)": from_minutes(pay_only),
-            "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only),
-            "REROUTE PAY": from_minutes(reroute),
-            "ASSIGN PAY": from_minutes(assign),
-            "G/SLIP PAY": from_minutes(gslip),
-            "TOTAL": from_minutes(total),
-            "debug_rows": build_lineholder_debug_rows(rows),
+            "TTL CREDIT": from_minutes(ttl_credit_mins),
+            "PAY TIME ONLY (single-time rows only)": from_minutes(pay_only_mins),
+            "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only_mins),
+            "G/SLIP PAY x2": from_minutes(gslip_twice_mins),
+            "ASSIGN PAY x2": from_minutes(assign_twice_mins),
+            "TOTAL": from_minutes(total_mins),
+            "debug_rows": [
+                {
+                    "Date": r["date"],
+                    "NBR": r["nbr"],
+                    "All Times": ", ".join(r["times"]),
+                    "Used in PAY TIME ONLY?": "Y" if len(r["times"]) == 1 else "N",
+                    "Used in ADDTL PAY ONLY?": (
+                        "Y" if (
+                            len(r["times"]) >= 2 and
+                            to_minutes(r["times"][-1]) < to_minutes(r["times"][-2])
+                        ) else "N"
+                    ),
+                }
+                for r in rows
+            ],
         }
+
     else:
         data = compute_reserve_total(raw)
         data["card_type"] = "RESERVE"
@@ -214,32 +217,62 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Auto-detects RESERVE vs LINEHOLDER and applies the correct pay rules.")
+st.caption("Automatically detects RESERVE vs LINEHOLDER and applies the right rules.")
+
+def handle_clear():
+    st.session_state["timecard_text"] = ""
+    st.session_state["calc"] = False
+
+with st.sidebar:
+    st.header("Examples")
+
+    if st.button("Load Lineholder Example"):
+        st.session_state["timecard_text"] = (
+            "01JUN REG 3554 6:30 TRANS TRANS 10:49 0:13 "
+            "05JUN REG 3210 7:24 10:30 10:30 10:30 "
+            "09JUN REG 3191 6:52 10:30 10:30 10:30 "
+            "17JUN REG 0889 2:20 10:30 10:30 10:30 "
+            "18JUN REG RRPY 3:09 "
+            "23JUN REG C428 15:01 15:45 15:45 15:45 0:38 "
+            "26JUN REG 0608 5:16 10:30 10:30 10:30 3:38 "
+            "27JUN REG RRPY 5:26 "
+            "28JUN REG 0451 1:35 10:30 10:30 3:23 "
+            "68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 "
+            "G/SLIP PAY : 10:30 ASSIGN PAY: 0:00 "
+            "END OF DISPLAY"
+        )
+
+# session state
+if "timecard_text" not in st.session_state:
+    st.session_state["timecard_text"] = ""
+if "calc" not in st.session_state:
+    st.session_state["calc"] = False
 
 st.text_area("Paste your timecard text here:", key="timecard_text", height=260)
 
 colA, colB = st.columns([1, 1])
-calc_btn = colA.button("Calculate", type="primary")
-clear_btn = colB.button("Clear", on_click=lambda: st.session_state.update(timecard_text="", calc=False))
-
-if "calc" not in st.session_state:
-    st.session_state["calc"] = False
-
-if calc_btn:
+if colA.button("Calculate", type="primary"):
     st.session_state["calc"] = True
+if colB.button("Clear", on_click=handle_clear):
+    pass
 
 if st.session_state["calc"]:
-    raw = st.session_state["timecard_text"]
-    result = compute_totals(raw)
-    st.subheader("Results")
-    c1, c2 = st.columns([1, 1])
-    c1.metric("Card Type", result["card_type"])
-    c2.metric("TOTAL PAY (H:MM)", result["TOTAL"])
-    rows = [(k, v) for k, v in result.items() if k not in ("card_type", "debug_rows", "TOTAL")]
-    df = pd.DataFrame(rows, columns=["Component", "Time"])
-    st.table(df)
-    if result.get("debug_rows"):
-        with st.expander("Row Debug"):
-            st.dataframe(pd.DataFrame(result["debug_rows"]), use_container_width=True)
+    comps = compute_totals(st.session_state["timecard_text"])
 
-st.caption("All math runs locally. No data stored.")
+    st.subheader("Results")
+    c1, c2 = st.columns(2)
+    c1.metric("Card Type", comps["card_type"])
+    c2.metric("TOTAL PAY", comps["TOTAL"])
+
+    df = pd.DataFrame(
+        [(k, v) for k, v in comps.items() if k not in ("card_type", "debug_rows")],
+        columns=["Component", "Time"]
+    )
+    st.table(df)
+
+    if "debug_rows" in comps:
+        with st.expander("Debug Rows"):
+            dbg = pd.DataFrame(comps["debug_rows"])
+            st.dataframe(dbg, use_container_width=True)
+
+st.caption("All calculations are local; no data is uploaded or stored.")
