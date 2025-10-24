@@ -143,31 +143,34 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 
 def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     """
-    Parse each duty-day row to figure out:
+    Parse each duty-day row and extract:
       - main_pay_candidate  -> PAY TIME ONLY (PAY NO CREDIT)
       - bump_pay_candidate  -> ADDTL PAY ONLY COLUMN
-      - has_credit_block    -> pairing-style repeated credit
+      - flags for debug
 
-    Logic for PAY TIME ONLY:
-      1. If NBR includes 'RRPY' (RRPY / ADJ-RRPY etc.), last time = pay.
+    MAIN PAY LOGIC (PAY TIME ONLY):
+      Rule A: If NBR includes 'RRPY' or 'RRPY' variant (ADJ-RRPY etc.),
+              then the last H:MM on that row is counted as PAY TIME ONLY.
+              (This applies to both RES and REG cards.)
 
-      2. If row ends [big_time, smaller bump], include big_time unless it's:
-         - a TRANS row
-         - clearly a pairing credit block (10:30 10:30 10:30 0:07)
-           that's already counted in SUB TTL CREDIT.
+      Rule B: Otherwise, for RES rows only:
+        If:
+          - there's NO pairing credit block (10:30 10:30 10:30 ...)
+          - ALL time values on that row are identical (e.g. "15:00 15:00")
+          - NBR is NOT "SICK"
+        then that identical time is counted as PAY TIME ONLY.
+        (This covers SCC, LOSA, VAC, PVEL, 20WD, 4F1C, etc.)
 
-      3. Reserve fallback (shape-based):
-         If:
-           - duty == RES
-           - there's NO credit block
-           - ALL time values on that row are the same
-             (e.g. "1:00 1:00", "15:00 15:00", "6:33 6:33", "32:05 32:05")
-           - NBR != "SICK"
-         then the last time counts as extra pay on top of guarantee.
+      We DO NOT otherwise pull "big pairing credit" values (like 15:45)
+      from flown trips anymore. Those are already baked into SUB TTL CREDIT.
 
-         If the row has multiple different time values
-         ("2:35 5:15 5:15") we skip it here; that scenario usually becomes
-         RES ASSIGN-G/SLIP PAY in the totals section.
+    BUMP PAY LOGIC (ADDTL PAY ONLY COLUMN):
+      We take the last time on the row as bump pay ONLY IF:
+        - there are at least 2 times on the row
+        - the last time is strictly smaller than the one before it
+        - the last time is NOT equal to the first time on the row
+          (this prevents counting patterns like "8:03 ... 8:03"
+           which are not actual add-on minutes, just block shown twice)
     """
     t = nbps(raw)
 
@@ -196,11 +199,10 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # All H:MM hits on that row
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # Does row mention TRANS?
-        has_trans = "TRANS" in tail_text.upper()
-
-        # Detect a credit block:
-        # same time repeated ≥3 times right before final add-on.
+        # ----- detect credit-block style pairing credit -----
+        # A "credit block" is something like:
+        #   ... 10:30 10:30 10:30 0:07
+        # same time repeated ≥3 times right before the last smaller add-on.
         has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
@@ -210,48 +212,30 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 has_credit_block = True
                 repeated_credit_value = last3[0]
 
-        # bump pay candidate = very last smaller chunk (ADDTL PAY ONLY COLUMN)
+        # ----- bump pay candidate (ADDTL PAY ONLY COLUMN) -----
         bump_pay_candidate = None
         if len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
-            if to_minutes(last_time) < to_minutes(prev_time):
-                bump_pay_candidate = last_time  # e.g. 0:07, 1:22, 6:32, etc.
+            prev_m = to_minutes(prev_time)
+            last_m = to_minutes(last_time)
+            # require strictly smaller AND not just repeating the first time
+            if last_m < prev_m and last_time != times[0]:
+                bump_pay_candidate = last_time  # e.g. 0:07, 1:22, 0:13, 3:38, etc.
 
-        # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
+        # ----- main pay candidate (PAY TIME ONLY / PAY NO CREDIT) -----
         main_pay_candidate = None
 
-        # Tier 1: explicit RRPY-style pay rows
+        # Rule A: RRPY / ADJ-RRPY style always counts (last time on row)
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
 
-        # Tier 2: pattern [big_time, smaller bump] at the end
-        elif len(times) >= 2:
-            prev_time = times[-2]
-            last_time = times[-1]
-            prev_m = to_minutes(prev_time)
-            last_m = to_minutes(last_time)
-
-            if last_m < prev_m:
-                # We include prev_time unless:
-                # - TRANS row
-                # - prev_time is just the repeated pairing-credit block
-                occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
-                repeated_block = (
-                    has_credit_block
-                    and repeated_credit_value == prev_time
-                    and len(occurrences_prev_before_last) >= 3
-                )
-                if (not has_trans) and (not repeated_block):
-                    main_pay_candidate = prev_time
-
-        # Tier 3: reserve fallback (shape-based, exclude SICK)
+        # Rule B: RES flat-pay style (SCC, LOSA, VAC, PVEL, 20WD, 4F1C, etc.)
+        #   all times identical, not SICK, no credit block.
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 unique_times = set(times)
-                # Only count rows where ALL times are the same AND it's not SICK.
-                # This covers SCC, LOSA, PVEL, VAC, 20WD, 4F1C, etc. but skips SICK.
                 if len(unique_times) == 1 and nbr != "SICK":
                     main_pay_candidate = times[-1]
 
@@ -261,7 +245,6 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             "nbr": nbr,
             "times": times,
             "has_credit_block": has_credit_block,
-            "has_trans": has_trans,
             "main_pay_candidate": main_pay_candidate,   # PAY TIME ONLY
             "bump_pay_candidate": bump_pay_candidate,   # ADDTL PAY ONLY
             "raw": seg_full.strip(),
@@ -295,9 +278,9 @@ def compute_components(raw: str) -> Dict[str, Any]:
 
     sub_ttl_credit_mins, sub_src = grab_sub_ttl_credit_minutes(raw)
 
-    # PAY TIME ONLY (PAY NO CREDIT) from rows
+    # PAY TIME ONLY (PAY NO CREDIT)
     pay_only_main_mins = 0
-    # ADDTL PAY ONLY COLUMN from rows
+    # ADDTL PAY ONLY COLUMN
     pay_only_bump_mins = 0
 
     debug_rows = []
@@ -319,7 +302,6 @@ def compute_components(raw: str) -> Dict[str, Any]:
             "NBR": r["nbr"],
             "Times": ", ".join(r["times"]),
             "Has credit block (3x repeat)?": "Y" if r["has_credit_block"] else "N",
-            "TRANS Row?": "Y" if r["has_trans"] else "N",
             "Added to PAY TIME ONLY": from_minutes(add_main) if add_main else "",
             "Added to ADDTL PAY ONLY": from_minutes(add_bump) if add_bump else "",
             "Raw Row Snippet": r["raw"][:200],
@@ -379,12 +361,11 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         + comps["training_pay_mins"]
     )
 
-    # Branch for RESERVE vs LINEHOLDER
+    # RESERVE includes RES ASSIGN-G/SLIP PAY (not G/SLIP PAY)
+    # LINEHOLDER includes G/SLIP PAY (not RES ASSIGN-G/SLIP PAY)
     if ct == "RESERVE":
-        # Reserve includes RES ASSIGN-G/SLIP PAY, does NOT include G/SLIP PAY
         total_mins = base_mins + comps["res_assign_gslip_mins"]
     else:
-        # Lineholder includes G/SLIP PAY, does NOT include RES ASSIGN-G/SLIP PAY
         total_mins = base_mins + comps["g_slip_pay_mins"]
 
     comps["total_mins"] = total_mins
@@ -408,17 +389,15 @@ def handle_clear():
     st.session_state["timecard_text"] = ""
     st.session_state["calc"] = False
 
-
 # --- Sidebar inputs / example loaders (no file upload) ---
 with st.sidebar:
     st.header("Input")
     example_btn_res = st.button("Load Reserve Example")
     example_btn_line = st.button("Load Lineholder Example")
 
-# Build example text if user clicked one of the example buttons
 default_text = ""
 if example_btn_res:
-    # Reserve example (~103:56 style), anonymized
+    # Reserve-ish example, anonymized
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -435,13 +414,11 @@ if example_btn_res:
         "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 0:00 "
         "G/SLIP PAY : 0:00 ASSIGN PAY: 0:00 RES ASSIGN-G/SLIP PAY: 10:30 "
         "REROUTE PAY: 10:30 "
-        "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
-        "14JUL25 QC11 DISTRIBUTED TRNG PAY: 1:29 "
         "END OF DISPLAY"
     )
 
 if example_btn_line:
-    # Lineholder example (~109:27 logic), anonymized
+    # Lineholder-ish example, anonymized
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
@@ -458,23 +435,21 @@ if example_btn_line:
         "68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 "
         "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 3:26 "
         "G/SLIP PAY : 10:30 REROUTE PAY: 0:00 ASSIGN PAY: 0:00 "
-        "RES ASSIGN-G/SLIP PAY: 0:00 "
         "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
         "14JUL25 QC11 DISTRIBUTED TRNG PAY: 1:29 "
         "END OF DISPLAY"
     )
 
-# Initialize session_state
+# init session state
 if "timecard_text" not in st.session_state:
     st.session_state["timecard_text"] = default_text
 elif default_text:
-    # if user clicked an example button this run, override
     st.session_state["timecard_text"] = default_text
 
 if "calc" not in st.session_state:
     st.session_state["calc"] = False
 
-# Text area bound to session_state
+# textarea
 st.text_area(
     "Paste your timecard text here:",
     key="timecard_text",
@@ -486,11 +461,9 @@ colA, colB = st.columns([1, 1])
 calc_btn = colA.button("Calculate", type="primary")
 clear_btn = colB.button("Clear", on_click=handle_clear)
 
-# Calculate button just flips the flag
 if calc_btn:
     st.session_state["calc"] = True
 
-# Results panel
 if st.session_state["calc"]:
     comps = compute_totals(st.session_state["timecard_text"])
 
