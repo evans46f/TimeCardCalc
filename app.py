@@ -138,7 +138,7 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 
 
 # ======================================================
-# Duty row parsing logic
+# Duty row parsing
 # ======================================================
 
 def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
@@ -146,31 +146,32 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     Parse each duty-day row and extract:
       - main_pay_candidate  -> PAY TIME ONLY (PAY NO CREDIT)
       - bump_pay_candidate  -> ADDTL PAY ONLY COLUMN
-      - flags for debug
+      - metadata flags (credit block, trans)
 
     MAIN PAY LOGIC (PAY TIME ONLY):
-      Rule A: If NBR includes 'RRPY' or 'RRPY' variant (ADJ-RRPY etc.),
-              then the last H:MM on that row is counted as PAY TIME ONLY.
-              (This applies to both RES and REG cards.)
+      Rule A: If NBR includes 'RRPY' (or 'ADJ-RRPY', etc.),
+              then the last H:MM on that row is PAY TIME ONLY.
+              (Works for RES and REG.)
 
-      Rule B: Otherwise, for RES rows only:
-        If:
-          - there's NO pairing credit block (10:30 10:30 10:30 ...)
-          - ALL time values on that row are identical (e.g. "15:00 15:00")
-          - NBR is NOT "SICK"
-        then that identical time is counted as PAY TIME ONLY.
-        (This covers SCC, LOSA, VAC, PVEL, 20WD, 4F1C, etc.)
+      Rule B: Otherwise, RES rows can generate PAY TIME ONLY if:
+        - there's NO pairing credit block (10:30 10:30 10:30 ...)
+        - ALL the H:MM times on that row are identical
+          (e.g. "15:00 15:00", "1:00 1:00", "6:33 6:33", "32:05 32:05")
+        - NBR is NOT "SICK"
+        - NBR is NOT "TOFF"
+        - the row does NOT contain the word "TRANS"
+        This covers SCC / LOSA / PVEL / 20WD / mystery codes like 4F1C, etc.
+        We EXCLUDE SICK, TOFF, TRANS because users say those should NOT stack.
 
-      We DO NOT otherwise pull "big pairing credit" values (like 15:45)
-      from flown trips anymore. Those are already baked into SUB TTL CREDIT.
+      We no longer grab pairing-credit values like 15:45 from flown trips; those
+      are already in SUB TTL CREDIT or in RES ASSIGN-G/SLIP PAY.
 
     BUMP PAY LOGIC (ADDTL PAY ONLY COLUMN):
       We take the last time on the row as bump pay ONLY IF:
         - there are at least 2 times on the row
         - the last time is strictly smaller than the one before it
-        - the last time is NOT equal to the first time on the row
-          (this prevents counting patterns like "8:03 ... 8:03"
-           which are not actual add-on minutes, just block shown twice)
+        - AND the last time is not equal to the first time on the row
+          (so we don't treat "8:03 ... 8:03" as add-on pay).
     """
     t = nbps(raw)
 
@@ -196,13 +197,14 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         seg_full  = (m.group(0) or "")
         tail_text = (m.group("tail") or "")
 
-        # All H:MM hits on that row
+        # Pull all H:MM in this row
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # ----- detect credit-block style pairing credit -----
-        # A "credit block" is something like:
-        #   ... 10:30 10:30 10:30 0:07
-        # same time repeated ≥3 times right before the last smaller add-on.
+        # Does the row mention TRANS?
+        has_trans = "TRANS" in tail_text.upper()
+
+        # Detect a 'pairing credit block':
+        # ... 10:30 10:30 10:30 0:07
         has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
@@ -212,31 +214,36 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 has_credit_block = True
                 repeated_credit_value = last3[0]
 
-        # ----- bump pay candidate (ADDTL PAY ONLY COLUMN) -----
+        # bump pay candidate (ADDTL PAY ONLY COLUMN):
         bump_pay_candidate = None
         if len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
             prev_m = to_minutes(prev_time)
             last_m = to_minutes(last_time)
-            # require strictly smaller AND not just repeating the first time
+            # only count if smaller and not just repeating the first time
             if last_m < prev_m and last_time != times[0]:
-                bump_pay_candidate = last_time  # e.g. 0:07, 1:22, 0:13, 3:38, etc.
+                bump_pay_candidate = last_time
 
-        # ----- main pay candidate (PAY TIME ONLY / PAY NO CREDIT) -----
+        # main pay candidate (PAY TIME ONLY):
         main_pay_candidate = None
 
-        # Rule A: RRPY / ADJ-RRPY style always counts (last time on row)
+        # Rule A: any RRPY variant => last time is pay
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
 
-        # Rule B: RES flat-pay style (SCC, LOSA, VAC, PVEL, 20WD, 4F1C, etc.)
-        #   all times identical, not SICK, no credit block.
+        # Rule B: RES flat-pay style rows, with exclusions
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 unique_times = set(times)
-                if len(unique_times) == 1 and nbr != "SICK":
+                if (
+                    len(unique_times) == 1
+                    and nbr not in ("SICK", "TOFF")
+                    and not has_trans
+                ):
+                    # e.g. SCC 1:00 1:00, LOSA 15:00 15:00, 20WD 10:00 10:00,
+                    # 4F1C 6:33 6:33, PVEL 10:00 10:00, etc.
                     main_pay_candidate = times[-1]
 
         rows.append({
@@ -245,6 +252,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             "nbr": nbr,
             "times": times,
             "has_credit_block": has_credit_block,
+            "has_trans": has_trans,
             "main_pay_candidate": main_pay_candidate,   # PAY TIME ONLY
             "bump_pay_candidate": bump_pay_candidate,   # ADDTL PAY ONLY
             "raw": seg_full.strip(),
@@ -301,13 +309,14 @@ def compute_components(raw: str) -> Dict[str, Any]:
             "Duty": r["duty"],
             "NBR": r["nbr"],
             "Times": ", ".join(r["times"]),
+            "TRANS row?": "Y" if r["has_trans"] else "N",
             "Has credit block (3x repeat)?": "Y" if r["has_credit_block"] else "N",
             "Added to PAY TIME ONLY": from_minutes(add_main) if add_main else "",
             "Added to ADDTL PAY ONLY": from_minutes(add_bump) if add_bump else "",
             "Raw Row Snippet": r["raw"][:200],
         })
 
-    # Buckets from the bottom summary section:
+    # Bottom-section buckets:
     reroute_pay_mins      = extract_named_bucket(raw, ["REROUTE PAY"])
     assign_pay_mins       = extract_named_bucket(raw, ["ASSIGN PAY"])
     g_slip_pay_mins       = extract_named_bucket(raw, ["G/SLIP PAY", "G SLIP PAY", "G - SLIP PAY"])
@@ -397,7 +406,7 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve-ish example, anonymized
+    # Reserve-ish anonymized example
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -418,7 +427,7 @@ if example_btn_res:
     )
 
 if example_btn_line:
-    # Lineholder-ish example, anonymized
+    # Lineholder-ish anonymized example
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
