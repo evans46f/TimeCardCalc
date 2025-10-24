@@ -204,9 +204,9 @@ def calc_pay_time_only_reserve(rows: List[Dict[str, Any]]) -> int:
     Rule:
     - Include any RES row whose NBR is NOT:
         * SICK
-        * a numeric pairing / trip code (e.g. '0097', '5501', etc.)
-      These are pay-no-credit style days like SCC, LOSA, FOSP, PJRY,
-      VAC, TRVL, PRPL, RRPY, etc.
+        * a numeric pairing / trip code (e.g. '0097', '5501', '0961', etc.)
+      These rows are pay-no-credit style days like:
+        SCC, LOSA, FOSP, PJRY, VAC, TRVL, PRPL, RRPY, etc.
 
     - For included rows, add the LAST time on that row.
     - Exclude actual pairings because those hours are already in SUB TTL CREDIT.
@@ -218,17 +218,32 @@ def calc_pay_time_only_reserve(rows: List[Dict[str, Any]]) -> int:
         if not times:
             continue
 
-        # Skip SICK
+        # exclude SICK
         if code == "SICK":
             continue
 
-        # Skip numeric / pairing-style codes (start with a digit)
+        # exclude obvious pairings/rotations (start with a digit)
         if re.match(r"^\d", code):
             continue
 
-        # Everything else counts (SCC, FOSP, PJRY, LOSA, VAC, TRVL, PRPL, RRPY, etc.)
+        # everything else counts in PAY TIME ONLY
         total += to_minutes(times[-1])
 
+    return total
+
+def calc_addtl_pay_only_reserve(rows: List[Dict[str, Any]]) -> int:
+    """
+    ADDTL PAY ONLY COLUMN for Reserve:
+    Tail bumps where final time is less than the time right before it.
+    """
+    total = 0
+    for r in rows:
+        times = r["times"]
+        if len(times) >= 2:
+            prev_last = to_minutes(times[-2])
+            last = to_minutes(times[-1])
+            if last < prev_last:
+                total += last
     return total
 
 # ======================================================
@@ -344,15 +359,16 @@ with st.sidebar:
 
     if st.button("Load Reserve Example"):
         st.session_state["timecard_text"] = (
-            "02DEC RES TRVL 2:00 2:00 "
-            "03DEC RES PRPL 10:00 10:00 "
-            "05DEC RES SCC 1:00 1:00 "
-            "08DEC RES 0427 5:15 5:15 "
-            "17DEC RES 5464 4:09 5:15 5:15 5:15 0:08 "
-            "19DEC RES LOSA 15:00 15:00 "
-            "29DEC RES 0961 2:56 5:15 5:15 5:15 "
-            "31DEC RES SCC 1:00 1:00 "
-            "10:30 + 40:49 + 0:00 = 51:19 - 0:00 + 0:00 = 51:19 "
+            "02OCT RES SCC 1:00 1:00 "
+            "03OCT RES SICK 4:19 4:19 4:19 "
+            "07OCT RES FOSP 30:00 30:00 "
+            "15OCT RES SCC 1:00 1:00 "
+            "16OCT RES SCC 1:00 1:00 "
+            "19OCT RES 0097 2:46 5:15 5:15 "
+            "28OCT RES PJRY 5:15 5:15 5:15 "
+            "29OCT RES SCC 1:00 1:00 "
+            "30OCT RES SICK 8:39 8:39 8:39 "
+            "18:13 + 43:56 + 0:00 = 62:09 - 0:00 + 0:00 = 62:09 "
             "RES ASSIGN-G/SLIP PAY: 5:15 "
             "DISTRIBUTED TRNG PAY: 1:52 "
             "END OF DISPLAY"
