@@ -55,7 +55,7 @@ def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
 
 def extract_numeric_field(raw: str, left_label_regex: str) -> int:
     """
-    Extract a single H:MM for a 'bank award' style field like:
+    Extract a single H:MM for 'bank award' style fields like:
       BANK DEP ... AWARD ... 0:00
       TTL BANK ... OPTS AWARD ... 3:26
 
@@ -77,8 +77,8 @@ def extract_training_pay_minutes(raw: str) -> int:
     Sum any 'DISTRIBUTED TRNG PAY:' lines.
 
     Example:
-      03JUL25 C365 DISTRIBUTED TRNG PAY:   1:00
-      14JUL25 QC11 DISTRIBUTED TRNG PAY:   1:29
+      ... DISTRIBUTED TRNG PAY:   1:00
+      ... DISTRIBUTED TRNG PAY:   1:29
 
     -> 1:00 + 1:29
     """
@@ -100,7 +100,7 @@ def extract_training_pay_minutes(raw: str) -> int:
 def _label_to_regex(lbl: str) -> str:
     """
     Turn 'G/SLIP PAY' into 'G\/SLIP\s+PAY' etc.
-    We escape tokens and join with \s+ to allow loose spacing.
+    We escape each word and join with \s+ to allow flexible spacing.
     """
     parts = re.split(r"\s+", lbl.strip())
     esc = [re.escape(p) for p in parts]
@@ -113,7 +113,6 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
       G/SLIP PAY : 10:30
       ASSIGN PAY: 0:00
       REROUTE PAY: 6:32
-    Returns 0 if not found.
     """
     t = nbps(text)
     for lbl in labels:
@@ -151,36 +150,37 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
       - debug flags
 
     MAIN PAY LOGIC (PAY TIME ONLY):
-      Rule A: If NBR includes 'RRPY' (RRPY, ADJ-RRPY etc.),
+      Rule A: If NBR includes 'RRPY' (RRPY, ADJ-RRPY, etc.),
               then the last H:MM on that row counts as PAY TIME ONLY.
-              (This applies for RES and REG.)
+              This applies for BOTH RES and REG rows.
+              (e.g. 'ADJ-RRPY 1:53 1:53', 'RRPY 3:09', 'RRPY 5:26')
 
       Rule B: Otherwise, RES rows can generate PAY TIME ONLY if ALL are true:
         - there's NO pairing credit block (like 10:30 10:30 10:30 ...)
         - ALL the H:MM times on that row are IDENTICAL
-          (e.g. "15:00 15:00", "1:00 1:00", "6:33 6:33", "32:05 32:05")
+          (e.g. '15:00 15:00', '1:00 1:00', '6:33 6:33', '32:05 32:05')
         - NBR is NOT "SICK"
         - NBR is NOT "TOFF"
         - the row text does NOT contain "TRANS"
-        This covers SCC / LOSA / PVEL / 20WD / 4F1C / VAC / PVEL / etc.
-        We EXCLUDE SICK, TOFF, TRANS because those should not stack on top.
+        This covers SCC / LOSA / PVEL / 20WD / VAC / LOSA / PVEL / 4F1C, etc.
+        We EXCLUDE SICK, TOFF, TRANS because those shouldn't stack.
 
-      Rule C: REG rows (lineholder pay add-ons):
-        If duty == 'REG' AND the row is basically a single clean pay bucket
-        (EXACTLY ONE time value on the whole row),
-        AND it is not a TRANS row,
-        then that time counts as PAY TIME ONLY.
-        This covers lines like "07OCT REG 44WD 10:00" that aren't in SUB TTL CREDIT.
+      Rule C: REG rows (lineholder add-on days like '44WD 10:00'):
+        If duty == 'REG'
+        AND row has EXACTLY ONE time value total
+        AND it's not a TRANS row
+        => that one time counts as PAY TIME ONLY.
+        This is how we count a lone 10:00 line that isn't in SUB TTL CREDIT.
 
       We do NOT grab pairing credit values like 15:45 or 26:15 again; those
-      are already part of SUB TTL CREDIT / guarantee.
+      are already in SUB TTL CREDIT (guarantee/credit line).
 
     BUMP PAY LOGIC (ADDTL PAY ONLY COLUMN):
       We take the last time on the row as bump pay ONLY IF:
-        - there are at least 2 times on the row
+        - there are at least 2 times on that row
         - the last time is strictly smaller than the one before it
         - AND the last time is NOT equal to the first time on the row
-          (avoids double-counting patterns like "8:03 ... 8:03").
+          (this prevents counting patterns like '8:03 ... 8:03' as an add-on).
     """
     t = nbps(raw)
 
@@ -209,11 +209,10 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # All H:MM tokens on this row:
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # Does the row mention TRANS?
+        # TRANS?
         has_trans = "TRANS" in tail_text.upper()
 
-        # Detect a 'pairing credit block':
-        # e.g. "10:30 10:30 10:30 0:07"
+        # Pairing credit block? e.g. "10:30 10:30 10:30 0:07"
         has_credit_block = False
         if len(times) >= 4:
             before_last = times[:-1]
@@ -228,19 +227,18 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             last_time = times[-1]
             prev_m = to_minutes(prev_time)
             last_m = to_minutes(last_time)
+            # only count real little bumps like 0:07, 1:22, 0:13, 3:38, etc.
             if last_m < prev_m and last_time != times[0]:
-                # classic bump: last (tiny) number like 0:07, 1:22, 0:13, 3:38
                 bump_pay_candidate = last_time
 
         # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
         main_pay_candidate = None
 
-        # Rule A: RRPY / ADJ-RRPY
-        if "RRPY" in nbr:
-            if times:
-                main_pay_candidate = times[-1]
+        # Rule A: ANY RRPY (RES or REG). Take last time on row.
+        if "RRPY" in nbr and times:
+            main_pay_candidate = times[-1]
 
-        # Rule B: RES flat-pay style SCC/LOSA/etc
+        # Rule B: RES flat-pay style SCC / LOSA / PVEL / 20WD / VAC / etc.
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 unique_times = set(times)
@@ -252,11 +250,11 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                     # ex: "LOSA 15:00 15:00", "SCC 1:00 1:00", "PVEL 10:00 10:00"
                     main_pay_candidate = times[-1]
 
-        # Rule C: REG single-pay style (lineholder add-on like "44WD 10:00")
+        # Rule C: REG single-pay add-on day ("44WD 10:00")
         if main_pay_candidate is None:
             if duty == "REG" and times and not has_trans:
                 if len(times) == 1:
-                    # ex: "07OCT REG 44WD 10:00"
+                    # e.g. "07OCT REG 44WD 10:00"
                     main_pay_candidate = times[0]
 
         rows.append({
@@ -475,7 +473,7 @@ elif default_text:
 if "calc" not in st.session_state:
     st.session_state["calc"] = False
 
-# textarea
+# textarea for paste
 st.text_area(
     "Paste your timecard text here:",
     key="timecard_text",
