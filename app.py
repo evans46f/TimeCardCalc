@@ -63,15 +63,18 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     total = 0
     for r in rows:
         times = r["times"]
+
         # RRPY rule
         if "RRPY" in r["nbr"] and times:
             total += to_minutes(times[-1])
             continue
+
         # Single-pay guarantee (e.g. 44WD 10:00)
         if (not r["has_trans"]) and len(times) == 1:
             total += to_minutes(times[0])
             continue
-        # Short-day min guarantee
+
+        # Short-day min guarantee (bump tail, appears twice)
         if (not r["has_trans"]) and len(times) >= 3:
             prev_last_str = times[-2]
             prev_last = to_minutes(prev_last_str)
@@ -81,7 +84,15 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
                 if cnt_prev_last == 2:
                     total += prev_last
                     continue
+
+        # NEW: identical last-two-times rule (e.g. 3:31 5:15 5:15)
+        if (not r["has_trans"]) and len(times) >= 2:
+            if times[-1] == times[-2]:
+                total += to_minutes(times[-1])
+                continue
+
     return total
+
 
 def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     total = 0
