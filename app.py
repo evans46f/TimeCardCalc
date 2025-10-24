@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 import streamlit as st
 import pandas as pd
 
@@ -8,6 +8,7 @@ import pandas as pd
 # ======================================================
 
 def to_minutes(s: str) -> int:
+    """H:MM -> total mins. Bad/blank -> 0."""
     if not isinstance(s, str):
         return 0
     m = re.match(r"^(\d{1,3}):([0-5]\d)$", s.strip())
@@ -16,12 +17,14 @@ def to_minutes(s: str) -> int:
     return int(m.group(1)) * 60 + int(m.group(2))
 
 def from_minutes(mins: int) -> str:
+    """total mins -> H:MM."""
     mins = max(0, int(mins))
     h = mins // 60
     m = mins % 60
     return f"{h}:{m:02d}"
 
 def clean(text: str) -> str:
+    """Normalize whitespace / nbsp."""
     return (text or "").replace("\u00A0", " ")
 
 
@@ -31,18 +34,19 @@ def clean(text: str) -> str:
 
 def detect_card_type(raw: str) -> str:
     """
-    Decide RESERVE vs LINEHOLDER by looking at the actual duty rows,
-    not the summary block.
+    Decide RESERVE vs LINEHOLDER by looking at actual duty rows,
+    not summary text.
 
     Logic:
-    - If any line matches "<DD><MMM><spaces>RES<spaces>" → RESERVE
-    - Else if any line matches "<DD><MMM><spaces>REG<spaces>" → LINEHOLDER
-    - Else default RESERVE
+    - If we see any row like "05MAR   RES ..."
+      (DDMMM then RES) => RESERVE
+    - Else if we see any row like "01JUN REG ..."
+      => LINEHOLDER
+    - If mixed, call it RESERVE.
+    - Else default RESERVE.
     """
-
     t = clean(raw).upper()
 
-    # look for actual duty rows like "05MAR   RES" or "01JUN REG"
     saw_res_row = re.search(r"\b\d{2}[A-Z]{3}\s+RES\b", t) is not None
     saw_reg_row = re.search(r"\b\d{2}[A-Z]{3}\s+REG\b", t) is not None
 
@@ -50,24 +54,19 @@ def detect_card_type(raw: str) -> str:
         return "RESERVE"
     if saw_reg_row and not saw_res_row:
         return "LINEHOLDER"
-
-    # tie-breaker:
-    # if both somehow appear (mixed month with RES and REG days),
-    # we'll call that RESERVE only if there's at least one RES row.
     if saw_res_row and saw_reg_row:
         return "RESERVE"
 
     return "RESERVE"
 
 
-
 # ======================================================
-# Shared text extractors
+# Shared extractors (summary blocks, etc)
 # ======================================================
 
 def extract_named_bucket(raw: str, label_regexes: List[str]) -> int:
     """
-    Get H:MM after labels like:
+    Grab H:MM after things like:
       REROUTE PAY:
       ASSIGN PAY:
       G/SLIP PAY :
@@ -106,16 +105,20 @@ def extract_ttl_bank_opts_award(raw: str) -> int:
 
 
 # ======================================================
-# Reserve-specific helpers
+# RESERVE HELPERS
 # ======================================================
 
 def extract_sub_ttl_credit(raw: str) -> int:
     """
-    SUB TTL CREDIT (reserve subtotal).
-    We'll try "SUB TTL CREDIT" first, else pull the first '= H:MM' before the minus.
+    SUB TTL CREDIT for reserve.
+    Example reserve block:
+      ... SUB TTL CREDIT ... 56:20 ...
+      10:30 + 45:50 + 0:00 = 56:20 - 0:00 + 0:00 = 56:20
+    We want the first '= H:MM' (56:20 in example).
     """
     t = clean(raw)
 
+    # direct "SUB TTL CREDIT"
     m = re.search(
         r"SUB\s+TTL\s+(?:CREDIT\s*)?[:=]?\s*([0-9]{1,3}:[0-5]\d)",
         t,
@@ -124,7 +127,7 @@ def extract_sub_ttl_credit(raw: str) -> int:
     if m:
         return to_minutes(m.group(1))
 
-    # fallback: pattern like "... = 68:34 - 0:00 + 3:26 = 72:00"
+    # fallback: first '= H:MM' before the '-'
     m2 = re.search(
         r"=\s*([0-9]{1,3}:[0-5]\d)\s*-\s*[0-9]{1,3}:[0-5]\d\s*\+\s*[0-9]{1,3}:[0-5]\d\s*=\s*[0-9]{1,3}:[0-5]\d",
         t,
@@ -139,11 +142,13 @@ def extract_sub_ttl_credit(raw: str) -> int:
 def extract_pay_time_only_minutes_list_reserve(raw: str) -> List[int]:
     """
     PAY TIME ONLY (PAY NO CREDIT) for RES:
-    Any RES row where final time repeats (SKED TIME == PAY TIME etc).
-    We don't care what the NBR is.
+    - For each RES duty row, if the last time repeats somewhere else
+      on that same row (SKED==PAY or PAY==CREDIT style),
+      count that last time.
     """
     t = clean(raw)
 
+    # match each RES row (date + RES + NBR ...)
     row_re = re.compile(
         r"(?P<date>\d{2}[A-Z]{3})\s+RES\s+(?P<nbr>[A-Z0-9/]+).*?(?=\n\d{2}[A-Z]{3}\s+RES|\n\s*\n|END OF DISPLAY|CREDIT\s+GUAR|$)",
         flags=re.I | re.S,
@@ -155,7 +160,6 @@ def extract_pay_time_only_minutes_list_reserve(raw: str) -> List[int]:
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
         if not times:
             continue
-
         last_val = times[-1]
         if times.count(last_val) >= 2:
             chunks.append(to_minutes(last_val))
@@ -165,8 +169,8 @@ def extract_pay_time_only_minutes_list_reserve(raw: str) -> List[int]:
 
 def extract_addtl_pay_only_tail_reserve(raw: str) -> int:
     """
-    ADDTL PAY ONLY COLUMN for RES:
-    Tail bump minutes if last < previous.
+    ADDTL PAY ONLY COLUMN (reserve):
+    - If last < previous, count last (tail bump).
     """
     t = clean(raw)
 
@@ -190,7 +194,7 @@ def extract_addtl_pay_only_tail_reserve(raw: str) -> int:
 
 def build_reserve_debug_rows(raw: str) -> List[Dict[str, Any]]:
     """
-    For visibility: each RES row + what we counted.
+    Transparency per RES row.
     """
     t = clean(raw)
 
@@ -204,8 +208,8 @@ def build_reserve_debug_rows(raw: str) -> List[Dict[str, Any]]:
         date = m.group("date").upper()
         nbr = m.group("nbr").upper()
         seg = m.group(0)
-
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
+
         pay_only_add = 0
         addtl_bump_add = 0
 
@@ -245,7 +249,6 @@ def compute_reserve_totals(raw: str) -> Dict[str, Any]:
       TTL BANK OPTS AWARD
     """
     sub_ttl_credit_mins = extract_sub_ttl_credit(raw)
-
     pay_time_only_mins = sum(extract_pay_time_only_minutes_list_reserve(raw))
     addtl_pay_only_mins = extract_addtl_pay_only_tail_reserve(raw)
 
@@ -291,71 +294,55 @@ def compute_reserve_totals(raw: str) -> Dict[str, Any]:
 
 
 # ======================================================
-# Lineholder-specific helpers
+# LINEHOLDER HELPERS
 # ======================================================
 
 def extract_ttl_credit_final(raw: str) -> int:
     """
-    TTL CREDIT (lineholder):
-    We want the LAST '= H:MM' from the guarantee math block, i.e. final credit.
-    Example block:
-      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
-    TTL CREDIT = 72:00
+    TTL CREDIT for lineholder.
+    We want final total credit after bank/opts fill.
+    Example:
+      68:34 - 0:00 + 3:26 = 72:00
+    -> 72:00
+    We'll take the LAST '= H:MM' group on that guarantee math line.
     """
     t = clean(raw)
 
-    # grab all '= H:MM' occurrences on that line and take the last one
-    m = re.search(
-        r"=\s*([0-9]{1,3}:[0-5]\d)[^\n]*=\s*([0-9]{1,3}:[0-5]\d)",
-        t,
-        flags=re.I,
-    )
-    if m:
-        # second capture group is the final
-        return to_minutes(m.group(2))
-
-    # fallback: last H:MM in that math line
-    m2 = re.search(
-        r"(\d{1,3}:[0-5]\d)[^\n]*END OF DISPLAY",
-        t,
-        flags=re.I,
-    )
-    if m2:
-        return to_minutes(m2.group(1))
+    # pull all '= H:MM', take the last
+    eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
+    if eq_times:
+        return to_minutes(eq_times[-1])
 
     return 0
 
 
-def parse_lineholder_rows(raw: str):
+def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
     """
-    Break out all REG rows.
-    We'll capture:
-      - list of all times
-      - whether row says TRANS
-      - pairing NBR (to detect RRPY)
+    Parse each REG duty line individually.
+    We do NOT try to consume multi-line blocks; we just read each line.
     """
-    t = clean(raw)
-
-    row_re = re.compile(
-        r"(?P<date>\d{2}[A-Z]{3})\s+REG\s+(?P<nbr>[A-Z0-9/]+)(?P<rest>.*?)(?=\n\d{2}[A-Z]{3}\s+REG|\n\s*\n|END OF DISPLAY|CREDIT\s+APPLICABLE|$)",
-        flags=re.I | re.S,
-    )
-
     rows = []
-    for m in row_re.finditer(t):
-        date = m.group("date").upper()
-        nbr = m.group("nbr").upper()
-        seg = m.group(0)
+    for line in clean(raw).splitlines():
+        line_up = line.upper().strip()
 
-        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
-        has_trans = "TRANS" in seg.upper()
+        # must start with "DDMMM REG ..."
+        m = re.match(r"^(\d{2}[A-Z]{3})\s+REG\s+(\S+)\s+(.*)$", line_up)
+        if not m:
+            continue
+
+        date = m.group(1)
+        nbr = m.group(2)
+        rest = m.group(3)
+
+        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", line_up)
+        has_trans = "TRANS" in line_up
 
         rows.append({
             "date": date,
             "nbr": nbr,
             "times": times,
             "has_trans": has_trans,
-            "raw": seg.strip(),
+            "raw": line.strip(),
         })
 
     return rows
@@ -364,28 +351,25 @@ def parse_lineholder_rows(raw: str):
 def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
     PAY TIME ONLY (PAY NO CREDIT) for lineholder:
-    - If NBR contains RRPY and there's a single duty value like "3:09", "5:26" => include it.
-    - If row has 3+ times and also has an extra tail bump (ex: 1:35 10:30 10:30 3:23),
-      we include the second-to-last time as guarantee pay (10:30 in example).
-      We do NOT require TRANS = False here for that pattern if it's clearly that structure.
-      We DO ignore pure pairing-credit block rows like 10:30 10:30 10:30 (no tail).
+    - RRPY rows: add the time (ex: 3:09, 5:26)
+    - Non-TRANS rows with a bump tail:
+        e.g. "1:35 10:30 10:30 3:23"
+        last < prev_last, so add prev_last (10:30)
+    - We do NOT count TRANS rows in this bucket.
+      (01JUN has TRANS so 10:49 doesn't count here)
     """
     total = 0
 
     for r in rows:
         times = r["times"]
-        nbr = r["nbr"]
 
         # RRPY rule
-        if "RRPY" in nbr and times:
-            # take the last time (this covers 3:09, 5:26)
+        if "RRPY" in r["nbr"] and times:
             total += to_minutes(times[-1])
             continue
 
-        # bump-tail rule like 28JUN:
-        # pattern: [..., X, X, Y] where Y < X
-        # we add that X (the second-to-last)
-        if len(times) >= 3:
+        # bump-tail rule (non-TRANS only)
+        if (not r["has_trans"]) and len(times) >= 3:
             prev_last = to_minutes(times[-2])
             last = to_minutes(times[-1])
             if last < prev_last:
@@ -398,14 +382,9 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
     ADDTL PAY ONLY COLUMN for lineholder:
-    - Look for tail bump minutes on REG rows:
-      if last < second-to-last, add last.
-    - This includes TRANS rows too.
-    Example:
-      01JUN ... 10:49 0:13  -> +0:13
-      23JUN ... 15:45 15:45 15:45 0:38 -> +0:38
-      26JUN ... 10:30 10:30 10:30 3:38 -> +3:38
-      28JUN ... 10:30 10:30 3:23 -> +3:23
+    - If last < prev_last, add last.
+    - This DOES include TRANS rows.
+      Examples that count: 0:13, 0:38, 3:38, 3:23
     """
     total = 0
     for r in rows:
@@ -420,38 +399,38 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 
 def build_lineholder_debug_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Show how we decided for each REG row.
+    Show how each REG row contributed.
     """
     out = []
     for r in rows:
         times = r["times"]
-        pay_only_add = 0
-        addtl_only_add = 0
 
-        # PAY TIME ONLY logic recap
+        # what we counted into PAY TIME ONLY
+        pay_only_add = ""
         if "RRPY" in r["nbr"] and times:
-            pay_only_add = to_minutes(times[-1])
-        elif len(times) >= 3:
+            pay_only_add = from_minutes(to_minutes(times[-1]))
+        elif (not r["has_trans"]) and len(times) >= 3:
             prev_last = to_minutes(times[-2])
             last = to_minutes(times[-1])
             if last < prev_last:
-                pay_only_add = prev_last
+                pay_only_add = from_minutes(prev_last)
 
-        # ADDTL PAY ONLY logic recap
+        # what we counted into ADDTL PAY ONLY
+        addtl_only_add = ""
         if len(times) >= 2:
             prev_last = to_minutes(times[-2])
             last = to_minutes(times[-1])
             if last < prev_last:
-                addtl_only_add = last
+                addtl_only_add = from_minutes(last)
 
         out.append({
             "Date": r["date"],
             "NBR": r["nbr"],
             "TRANS row?": "Y" if r["has_trans"] else "N",
             "All Times": ", ".join(times),
-            "Counted PAY TIME ONLY": from_minutes(pay_only_add) if pay_only_add else "",
-            "Counted ADDTL PAY ONLY": from_minutes(addtl_only_add) if addtl_only_add else "",
-            "Raw Snip": r["raw"][:200],
+            "Counted PAY TIME ONLY": pay_only_add,
+            "Counted ADDTL PAY ONLY": addtl_only_add,
+            "Raw Line": r["raw"][:200],
         })
 
     return out
@@ -525,8 +504,9 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 # ======================================================
 
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
+
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Detects RES vs REG, applies the right rules for that type.")
+st.caption("Detects RES vs REG and applies the right rules for that type.")
 
 def handle_clear():
     st.session_state["timecard_text"] = ""
@@ -546,22 +526,22 @@ MONTHLY TIME DATA
          DAY    ROT      BLOCK      SKED      PAY                PAY            
  DATE    DES    NBR       HRS       TIME      TIME    CREDIT     ONLY           
 
- 05MAR   RES    4F1C                6:33      6:33                              
- 05MAR   RES    4560      9:38     10:30     10:30     10:30                    
- 12MAR   RES    SCC                 1:00      1:00                              
- 21MAR   RES    0056      2:35      5:15      5:15                              
- 25MAR   RES    LOSA               15:00     15:00                              
+ 05MAR   RES    4F1C                6:33      6:33
+ 05MAR   RES    4560      9:38     10:30     10:30     10:30
+ 12MAR   RES    SCC                 1:00      1:00
+ 21MAR   RES    0056      2:35      5:15      5:15
+ 25MAR   RES    LOSA               15:00     15:00
 
-            RES      OTHER   SUB TTL   PAYBACK   BANK OPT 1    TTL   BANK OPT 1 
- CREDIT     GUAR     GUAR    CREDIT    NEG BANK      AWD      CREDIT    LIMIT   
-  10:30 +  45:50 +   0:00 =  56:20  -   0:00   +    0:00  =  56:20     77:00    
+            RES      OTHER   SUB TTL   PAYBACK   BANK OPT 1    TTL   BANK OPT 1
+ CREDIT     GUAR     GUAR    CREDIT    NEG BANK      AWD      CREDIT    LIMIT
+  10:30 +  45:50 +   0:00 =  56:20  -   0:00   +    0:00  =  56:20     77:00
 
-              BANK DEP      TTL BANK     G/SLIP      OUT                        
-                AWARD      OPTS AWARD    CREDIT      BANK                       
-                0:00           0:00        0:00     -  1:08                     
+              BANK DEP      TTL BANK     G/SLIP      OUT
+                AWARD      OPTS AWARD    CREDIT      BANK
+                0:00           0:00        0:00     -  1:08
 
- G/SLIP PAY :   0:00      ASSIGN PAY:   0:00     RES ASSIGN-G/SLIP PAY:   5:15  
- REROUTE PAY:   0:00                             RES LOOK BACK GUAR   :   0:00  
+ G/SLIP PAY :   0:00      ASSIGN PAY:   0:00     RES ASSIGN-G/SLIP PAY:   5:15
+ REROUTE PAY:   0:00                             RES LOOK BACK GUAR   :   0:00
 
  END OF DISPLAY
         """.strip()
@@ -572,10 +552,10 @@ MONTHLY TIME DATA
 MONTHLY TIME DATA           
 
  BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059
- NAME: BOYES,CHRISTOPHE EMP NBR:0759386             
+ NAME: BOYES,CHRISTOPHE EMP NBR:0759386
 
-         DAY ROT BLOCK SKED PAY PAY            
- DATE DES NBR HRS TIME TIME CREDIT ONLY           
+         DAY ROT BLOCK SKED PAY PAY
+ DATE DES NBR HRS TIME TIME CREDIT ONLY
 
  01JUN REG 3554 6:30 TRANS TRANS 10:49 0:13
  05JUN REG 3210 7:24 10:30 10:30 10:30
@@ -589,6 +569,8 @@ MONTHLY TIME DATA
 
   68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
 
+ CREDIT APPLICABLE TO REG G/S SLIP PAY: 72:00 REG G/S TRIGGER: 72:00
+
  G/SLIP PAY : 10:30 ASSIGN PAY: 0:00
  REROUTE PAY: 0:00
 
@@ -601,7 +583,7 @@ if "timecard_text" not in st.session_state:
 if "calc" not in st.session_state:
     st.session_state["calc"] = False
 
-# input
+# main input
 st.text_area(
     "Paste your timecard text here:",
     key="timecard_text",
