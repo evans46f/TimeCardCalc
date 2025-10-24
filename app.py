@@ -96,7 +96,7 @@ def extract_training_pay_minutes(raw: str) -> int:
 def _label_to_regex(lbl: str) -> str:
     """
     Turn 'G/SLIP PAY' into flexible 'G/SLIP\s+PAY'.
-    We escape tokens and re-join with \s+ for loose spacing.
+    We escape each token and re-join with \s+ for loose spacing.
     """
     parts = re.split(r"\s+", lbl.strip())
     esc = [re.escape(p) for p in parts]
@@ -136,8 +136,7 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 # ======================================================
 
 # Reserve-coded duties that are ALWAYS extra pay on top of the guarantee
-# (not already "trip credit"): SCC, LOSA, PVEL, VAC, etc.
-# We added "23M7" here after seeing it behave like paid ground duty.
+# (not already "trip credit"): SCC, LOSA, PVEL, VAC, 23M7, etc.
 RES_FALLBACK_ELIGIBLE_CODES = {
     "SCC",
     "PVEL",
@@ -423,6 +422,7 @@ st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 st.title("🧮 Timecard Pay Calculator")
 st.caption("Auto-detects RESERVE vs LINEHOLDER. Applies the right contract math.")
 
+# --- Sidebar inputs / example loaders ---
 with st.sidebar:
     st.header("Input")
     uploaded = st.file_uploader("Upload timecard text (.txt)", type=["txt"])
@@ -430,13 +430,14 @@ with st.sidebar:
     example_btn_res = st.button("Load Reserve Example")
     example_btn_line = st.button("Load Lineholder Example")
 
+# --- Prepare default text logic ---
 default_text = ""
 if example_btn_res:
-    # Reserve example (John Oct ~103:56 logic)
+    # Reserve example (~103:56 logic), anonymized
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
-        "NAME: EVANS,JOHN EMP NBR:0618143 "
+        "TEMP IN BANK -1:08 IN BANK -1:08 ALV 77:45 "
         "06OCT RES SCC 1:00 1:00 "
         "09OCT RES SCC 1:00 1:00 "
         "11OCT RES 0991 1:50 10:30 10:30 "
@@ -446,7 +447,7 @@ if example_btn_res:
         "20OCT RES PVEL 10:00 10:00 "
         "22OCT RES LOSA 10:00 10:00 "
         "17:51 + 39:43 + 0:00 = 57:34 - 0:00 + 0:00 = 57:34 "
-        "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 0:00 "
+        'BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 0:00 '
         "G/SLIP PAY : 0:00 ASSIGN PAY: 0:00 RES ASSIGN-G/SLIP PAY: 10:30 "
         "REROUTE PAY: 10:30 "
         "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
@@ -455,11 +456,11 @@ if example_btn_res:
     )
 
 if example_btn_line:
-    # Lineholder example (June Christophe ~109:27 logic)
+    # Lineholder example (~109:27 logic), anonymized
     default_text = (
         "MONTHLY TIME DATA 10/24/25 08:38:49 "
         "BID PERIOD: 02JUN25 - 01JUL25 ATL 73N B INIT LOT: 0059 "
-        "NAME: BOYES,CHRISTOPHE EMP NBR:0759386 "
+        "TEMP IN BANK 0:00 IN BANK 0:00 ALV 79:49 "
         "01JUN REG 3554 6:30 TRANS TRANS 10:49 0:13 "
         "05JUN REG 3210 7:24 10:30 10:30 10:30 "
         "09JUN REG 3191 6:52 10:30 10:30 10:30 "
@@ -478,17 +479,27 @@ if example_btn_line:
         "END OF DISPLAY"
     )
 
-text_value = ""
+# --- Uploaded file overrides default_text if present ---
 if uploaded is not None:
     try:
-        text_value = uploaded.read().decode("utf-8", errors="ignore")
+        uploaded_text = uploaded.read().decode("utf-8", errors="ignore")
     except Exception:
-        text_value = uploaded.read().decode("latin1", errors="ignore")
+        uploaded_text = uploaded.read().decode("latin1", errors="ignore")
+    default_text = uploaded_text
 
+# --- Session state setup for textarea content ---
+if "timecard_text" not in st.session_state:
+    st.session_state["timecard_text"] = default_text
+else:
+    # if user clicked example button or uploaded a file, override current text
+    if default_text:
+        st.session_state["timecard_text"] = default_text
+
+# --- Text input area bound to session_state ---
 text_area = st.text_area(
     "Paste your timecard text here:",
-    value=(text_value or default_text),
-    height=260
+    key="timecard_text",
+    height=260,
 )
 
 st.divider()
@@ -496,15 +507,18 @@ colA, colB = st.columns([1, 1])
 calc = colA.button("Calculate", type="primary")
 clear = colB.button("Clear")
 
+# --- Clear button behavior (no rerun, no crash) ---
 if clear:
-    st.session_state.pop("calc", None)
-    st.experimental_rerun()
+    st.session_state["timecard_text"] = ""
+    st.session_state["calc"] = False
 
+# --- Calculate button behavior ---
 if calc:
     st.session_state["calc"] = True
 
+# --- Results panel ---
 if st.session_state.get("calc"):
-    comps = compute_totals(text_area)
+    comps = compute_totals(st.session_state["timecard_text"])
 
     st.subheader("Results")
 
