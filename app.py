@@ -141,26 +141,30 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 # Duty row parsing logic
 # ======================================================
 
-# Reserve-coded duties that always stack on top of the guarantee:
-# SCC, LOSA, PVEL, VAC, 23M7, ADJ-RRPY, etc.
-RES_FALLBACK_ELIGIBLE_CODES = {
-    "SCC",
-    "PVEL",
-    "LOSA",
-    "VAC",
-    "23M7",
-    "ADJ-RRPY",
-    "ADJ",
-    "ADJ/RRPY",
-}
-
-
 def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     """
     Parse each duty-day row to figure out:
       - main_pay_candidate  -> PAY TIME ONLY (PAY NO CREDIT)
       - bump_pay_candidate  -> ADDTL PAY ONLY COLUMN
       - has_credit_block    -> pairing-style repeated credit
+
+    Logic for PAY TIME ONLY:
+      1. If NBR includes 'RRPY' (RRPY / ADJ-RRPY etc.), last time = pay.
+
+      2. If row ends [big_time, smaller bump], include big_time unless it's:
+         - a TRANS row
+         - clearly a pairing credit block (10:30 10:30 10:30 0:07)
+           that's already counted in SUB TTL CREDIT.
+
+      3. Reserve fallback (shape-based, no whitelist):
+         If duty == RES, there's NO credit block, and ALL time values on that
+         row are the same (e.g. "1:00 1:00", "15:00 15:00", "32:05 32:05",
+         "6:33 6:33"), then the last time counts as extra pay on top of
+         guarantee.
+
+         BUT if the row has multiple different time values
+         (like "2:35 5:15 5:15"), skip it here. That scenario usually shows up
+         in RES ASSIGN-G/SLIP PAY at the bottom, and we'll add that separately.
     """
     t = nbps(raw)
 
@@ -191,12 +195,11 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # All H:MM hits on that row
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # Check if "TRANS" appears in the row text
+        # Does row mention TRANS?
         has_trans = "TRANS" in tail_text.upper()
 
-        # Detect a credit block: same time repeated ≥3 times right before final add-on.
-        # If the last 3 times before the last token are identical, e.g.
-        # "10:30 10:30 10:30 0:07"
+        # Detect a credit block:
+        # same time repeated ≥3 times right before final add-on.
         has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
@@ -212,19 +215,17 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             prev_time = times[-2]
             last_time = times[-1]
             if to_minutes(last_time) < to_minutes(prev_time):
-                bump_pay_candidate = last_time  # e.g. 0:07, 1:22, 6:32...
+                bump_pay_candidate = last_time  # e.g. 0:07, 1:22, 6:32, etc.
 
         # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
         main_pay_candidate = None
 
-        # Tier 1: If code looks like RRPY or ADJ-RRPY etc.,
-        # we treat the final time on that row as standalone pay.
+        # Tier 1: explicit RRPY-style pay rows
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
 
-        # Tier 2: Pattern [big_time, then smaller bump], like:
-        # "... 10:49 0:13" or "... 10:30 10:30 10:30 6:32"
+        # Tier 2: pattern [big_time, smaller bump] at the end
         elif len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
@@ -232,9 +233,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             last_m = to_minutes(last_time)
 
             if last_m < prev_m:
-                # We include prev_time unless:
-                #  - row is TRANS (already counted elsewhere)
-                #  - prev_time is just the repeated pairing credit block
+                # We include prev_time unless TRANS or it's just the repeated trip-credit block
                 occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
                 repeated_block = (
                     has_credit_block
@@ -244,13 +243,15 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 if (not has_trans) and (not repeated_block):
                     main_pay_candidate = prev_time
 
-        # Tier 3: Reserve fallback.
-        # If it's RES, there's no pairing credit block,
-        # and the code is one of SCC / LOSA / VAC / PVEL / 23M7 / etc.,
-        # treat the last time on that row as payable extra.
+        # Tier 3: reserve fallback (shape-based)
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
-                if nbr in RES_FALLBACK_ELIGIBLE_CODES:
+                unique_times = set(times)
+                # If *all* times on this row are the same (e.g. "1:00 1:00"),
+                # treat that as pure pay to stack on top of guarantee.
+                # But if there are multiple distinct times, skip here
+                # (likely handled by RES ASSIGN-G/SLIP PAY).
+                if len(unique_times) == 1:
                     main_pay_candidate = times[-1]
 
         rows.append({
@@ -399,7 +400,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Auto-detects RESERVE vs LINEHOLDER.")
+st.caption("Auto-detects RESERVE vs LINEHOLDER. Applies the right contract math.")
 
 # --- helper: Clear button callback ---
 def handle_clear():
@@ -407,7 +408,7 @@ def handle_clear():
     st.session_state["calc"] = False
 
 
-# --- Sidebar inputs / example loaders (no file upload anymore) ---
+# --- Sidebar inputs / example loaders (no file upload) ---
 with st.sidebar:
     st.header("Input")
     example_btn_res = st.button("Load Reserve Example")
@@ -416,7 +417,7 @@ with st.sidebar:
 # Build example text if user clicked one of the example buttons
 default_text = ""
 if example_btn_res:
-    # Reserve example (~103:56 result style), anonymized
+    # Reserve example (~103:56 style), anonymized
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
