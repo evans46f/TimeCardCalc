@@ -76,10 +76,8 @@ def extract_training_pay_minutes(raw: str) -> int:
     """
     Sum DISTRIBUTED TRNG PAY lines, e.g.:
 
-      03JUL25 C365 DISTRIBUTED TRNG PAY:   1:00
-      14JUL25 QC11 DISTRIBUTED TRNG PAY:   1:29
-
-    -> 1:00 + 1:29
+      ... DISTRIBUTED TRNG PAY: 1:00
+      ... DISTRIBUTED TRNG PAY: 1:29
     """
     t = nbps(raw)
     total = 0
@@ -149,27 +147,27 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
       - has_credit_block    -> pairing-style repeated credit
 
     Logic for PAY TIME ONLY:
-      1. If NBR includes 'RRPY' (RRPY / ADJ-RRPY etc.), last time = pay.
+      Tier 1. If NBR contains 'RRPY' (RRPY / ADJ-RRPY etc.), last time = pay.
 
-      2. If row ends [big_time, smaller bump], include big_time unless it's:
-         - a TRANS row
-         - clearly a pairing credit block (10:30 10:30 10:30 0:07)
-           that's already counted in SUB TTL CREDIT.
+      Tier 2. If this is a REG row and it ends [big_time, smaller bump],
+              include big_time unless it's:
+                - a TRANS row
+                - clearly a pairing credit block (10:30 10:30 10:30 0:07).
+              We DO NOT apply this tier to RES rows anymore.
 
-      3. Reserve fallback (shape-based, no whitelist):
-         If duty == RES, there's NO credit block, and ALL time values on that
-         row are the same (e.g. "1:00 1:00", "15:00 15:00", "32:05 32:05",
-         "6:33 6:33"), then the last time counts as extra pay on top of
-         guarantee.
+      Tier 3. Reserve fallback (shape-based):
+         If duty == RES, NO credit block,
+         and ALL time values on that row are the same (e.g. "1:00 1:00",
+         "15:00 15:00", "6:33 6:33", "32:05 32:05"),
+         and NBR != "SICK",
+         then the last time counts as extra pay on top of guarantee.
 
-         BUT if the row has multiple different time values
-         (like "2:35 5:15 5:15"), skip it here. That scenario usually shows up
-         in RES ASSIGN-G/SLIP PAY at the bottom, and we'll add that separately.
+         If there are multiple different time values on the row
+         (like "2:35 5:15 5:15"), skip counting it here. Those cases are
+         usually already handled later by RES ASSIGN-G/SLIP PAY etc.
     """
     t = nbps(raw)
 
-    # One "row" is like:
-    # 15OCT RES 5999 5:14 10:30 10:30 10:30 0:07
     seg_re = re.compile(
         r"(?P<date>\d{2}[A-Z]{3})\s+"
         r"(?P<duty>(RES|REG))\s+"
@@ -199,7 +197,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         has_trans = "TRANS" in tail_text.upper()
 
         # Detect a credit block:
-        # same time repeated ≥3 times right before final add-on.
+        # same time repeated ≥3 times right before the final smaller piece.
         has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
@@ -220,20 +218,20 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
         main_pay_candidate = None
 
-        # Tier 1: explicit RRPY-style pay rows
+        # Tier 1: explicit RRPY-style pay rows (RES or REG)
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
 
-        # Tier 2: pattern [big_time, smaller bump] at the end
-        elif len(times) >= 2:
+        # Tier 2: REG-only "big_time then small bump" pattern
+        elif duty == "REG" and len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
             prev_m = to_minutes(prev_time)
             last_m = to_minutes(last_time)
 
             if last_m < prev_m:
-                # We include prev_time unless TRANS or it's just the repeated trip-credit block
+                # include prev_time unless TRANS or it's just the repeated trip-credit block
                 occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
                 repeated_block = (
                     has_credit_block
@@ -243,15 +241,14 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 if (not has_trans) and (not repeated_block):
                     main_pay_candidate = prev_time
 
-        # Tier 3: reserve fallback (shape-based)
+        # Tier 3: Reserve fallback (shape-based, excludes SICK)
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 unique_times = set(times)
-                # If *all* times on this row are the same (e.g. "1:00 1:00"),
-                # treat that as pure pay to stack on top of guarantee.
-                # But if there are multiple distinct times, skip here
-                # (likely handled by RES ASSIGN-G/SLIP PAY).
-                if len(unique_times) == 1:
+                # All times identical? (e.g. '10:00 10:00', '6:33 6:33', '32:05 32:05')
+                # and not SICK. That means it's standalone pay (SCC, LOSA, PVEL, 4F1C,
+                # 20WD, VAC, etc.) that stacks on top.
+                if len(unique_times) == 1 and nbr != "SICK":
                     main_pay_candidate = times[-1]
 
         rows.append({
