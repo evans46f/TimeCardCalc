@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 
 # ======================================================
-# Basic helpers
+# Helpers
 # ======================================================
 
 def to_minutes(s: str) -> int:
@@ -28,9 +28,6 @@ def clean(t: str) -> str:
 # ======================================================
 
 def detect_card_type(raw: str) -> str:
-    """
-    Decide RESERVE vs LINEHOLDER by looking at actual duty rows.
-    """
     t = clean(raw).upper()
     saw_res_row = re.search(r"\b\d{2}[A-Z]{3}\s+RES\b", t) is not None
     saw_reg_row = re.search(r"\b\d{2}[A-Z]{3}\s+REG\b", t) is not None
@@ -44,26 +41,20 @@ def detect_card_type(raw: str) -> str:
     return "RESERVE"
 
 # ======================================================
-# Duty Row Parser
+# Row Parsers
 # ======================================================
 
 def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
-    """
-    Parse only the actual duty rows (not summary blocks).
-    Stops at RES OTHER SUB TTL, CREDIT APPLICABLE, or END OF DISPLAY.
-    """
     t = clean(raw)
     seg_re = re.compile(
         r"(?P<date>\d{2}[A-Z]{3})\s+REG\s+(?P<nbr>[A-Z0-9/-]+)"
         r"(?P<tail>.*?)(?="
-        r"\d{2}[A-Z]{3}\s+REG\b|"  # next duty row
-        r"RES\s+OTHER\s+SUB\s+TTL|"  # start of summary
-        r"CREDIT\s+APPLICABLE|"      # start of summary
-        r"END OF DISPLAY|$"          # end of block
-        r")",
+        r"\d{2}[A-Z]{3}\s+REG\b|"
+        r"RES\s+OTHER\s+SUB\s+TTL|"
+        r"CREDIT\s+APPLICABLE|"
+        r"END OF DISPLAY|$)",
         re.I | re.S,
     )
-
     rows = []
     for m in seg_re.finditer(t):
         seg_full = m.group(0)
@@ -77,8 +68,31 @@ def parse_lineholder_rows(raw: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_reserve_rows(raw: str) -> List[Dict[str, Any]]:
+    t = clean(raw)
+    seg_re = re.compile(
+        r"(?P<date>\d{2}[A-Z]{3})\s+RES\s+(?P<nbr>[A-Z0-9/-]+)"
+        r"(?P<tail>.*?)(?="
+        r"\d{2}[A-Z]{3}\s+RES\b|"
+        r"RES\s+OTHER\s+SUB\s+TTL|"
+        r"CREDIT\s+APPLICABLE|"
+        r"END OF DISPLAY|$)",
+        re.I | re.S,
+    )
+    rows = []
+    for m in seg_re.finditer(t):
+        seg_full = m.group(0)
+        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
+        rows.append({
+            "date": (m.group("date") or "").upper(),
+            "nbr": (m.group("nbr") or "").upper(),
+            "times": times,
+            "raw": seg_full.strip(),
+        })
+    return rows
+
 # ======================================================
-# Numeric extractors
+# Extractors
 # ======================================================
 
 def extract_named_bucket(text: str, labels: List[str]) -> int:
@@ -91,9 +105,6 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
     return 0
 
 def grab_sub_ttl_credit_minutes(raw: str) -> int:
-    """
-    Parse final total credit from guarantee math line.
-    """
     t = clean(raw)
     eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
     if eq_times:
@@ -101,13 +112,10 @@ def grab_sub_ttl_credit_minutes(raw: str) -> int:
     return 0
 
 # ======================================================
-# Pay logic – Lineholder
+# Lineholder Logic
 # ======================================================
 
 def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
-    """
-    Include a REG row only if that line has exactly ONE time value.
-    """
     total = 0
     for r in rows:
         times = r["times"]
@@ -116,9 +124,6 @@ def calc_pay_time_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     return total
 
 def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
-    """
-    ADDTL PAY ONLY COLUMN: if last time < previous time.
-    """
     total = 0
     for r in rows:
         times = r["times"]
@@ -130,38 +135,31 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     return total
 
 # ======================================================
-# Reserve total logic
+# Reserve Logic
 # ======================================================
 
-def compute_reserve_total(raw: str) -> Dict[str, Any]:
-    t = clean(raw)
+def calc_pay_time_only_reserve(rows: List[Dict[str, Any]]) -> int:
+    total = 0
+    for r in rows:
+        times = r["times"]
+        if not times:
+            continue
+        if len(set(times)) == 1:
+            total += to_minutes(times[-1])
+        elif len(times) >= 2 and times[-1] == times[-2]:
+            total += to_minutes(times[-1])
+    return total
 
-    def find_minutes(label: str) -> int:
-        m = re.search(rf"{label}\s*[:]\s*([0-9]{{1,3}}:[0-5][0-9])", t, re.I)
-        return to_minutes(m.group(1)) if m else 0
-
-    sub_ttl = grab_sub_ttl_credit_minutes(t)
-    pay_time_only = sum(to_minutes(x) for x in re.findall(r"\b(\d{1,3}:[0-5]\d)\b", t.split("PAY TIME ONLY")[-1])) if "PAY TIME ONLY" in t else 0
-    addtl_only = sum(to_minutes(x) for x in re.findall(r"\b(\d{1,3}:[0-5]\d)\b", t.split("ADDTL PAY ONLY")[-1])) if "ADDTL PAY ONLY" in t else 0
-    reroute = find_minutes("REROUTE PAY")
-    assign = find_minutes("ASSIGN PAY")
-    res_assign = find_minutes("RES ASSIGN-G/SLIP PAY")
-    bank_dep = find_minutes("BANK DEP AWARD")
-    ttl_bank = find_minutes("TTL BANK OPTS AWARD")
-
-    total = sub_ttl + pay_time_only + addtl_only + reroute + assign + res_assign + bank_dep + ttl_bank
-
-    return {
-        "TTL CREDIT": from_minutes(sub_ttl),
-        "PAY TIME ONLY": from_minutes(pay_time_only),
-        "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only),
-        "REROUTE PAY": from_minutes(reroute),
-        "ASSIGN PAY": from_minutes(assign),
-        "RES ASSIGN-G/SLIP PAY": from_minutes(res_assign),
-        "BANK DEP AWARD": from_minutes(bank_dep),
-        "TTL BANK OPTS AWARD": from_minutes(ttl_bank),
-        "TOTAL": from_minutes(total),
-    }
+def calc_addtl_pay_only_reserve(rows: List[Dict[str, Any]]) -> int:
+    total = 0
+    for r in rows:
+        times = r["times"]
+        if len(times) >= 2:
+            prev_last = to_minutes(times[-2])
+            last = to_minutes(times[-1])
+            if last < prev_last:
+                total += last
+    return total
 
 # ======================================================
 # Compute Totals
@@ -172,14 +170,11 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 
     if card_type == "LINEHOLDER":
         rows = parse_lineholder_rows(raw)
-
         ttl_credit_mins = grab_sub_ttl_credit_minutes(raw)
         pay_only_mins = calc_pay_time_only_lineholder(rows)
         addtl_only_mins = calc_addtl_pay_only_lineholder(rows)
-
         gslip_mins = extract_named_bucket(raw, ["G/SLIP PAY"])
         assign_mins = extract_named_bucket(raw, ["ASSIGN PAY"])
-
         gslip_twice_mins = 2 * gslip_mins
         assign_twice_mins = 2 * assign_mins
 
@@ -199,27 +194,39 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             "G/SLIP PAY x2": from_minutes(gslip_twice_mins),
             "ASSIGN PAY x2": from_minutes(assign_twice_mins),
             "TOTAL": from_minutes(total_mins),
-            "debug_rows": [
-                {
-                    "Date": r["date"],
-                    "NBR": r["nbr"],
-                    "All Times": ", ".join(r["times"]),
-                    "Used in PAY TIME ONLY?": "Y" if len(r["times"]) == 1 else "N",
-                    "Used in ADDTL PAY ONLY?": (
-                        "Y" if (
-                            len(r["times"]) >= 2 and
-                            to_minutes(r["times"][-1]) < to_minutes(r["times"][-2])
-                        ) else "N"
-                    ),
-                }
-                for r in rows
-            ],
         }
 
     else:
-        data = compute_reserve_total(raw)
-        data["card_type"] = "RESERVE"
-        return data
+        rows = parse_reserve_rows(raw)
+        sub_ttl_mins = grab_sub_ttl_credit_minutes(raw)
+        pay_time_mins = calc_pay_time_only_reserve(rows)
+        addtl_only_mins = calc_addtl_pay_only_reserve(rows)
+        reroute_mins = extract_named_bucket(raw, ["REROUTE PAY"])
+        assign_mins = extract_named_bucket(raw, ["ASSIGN PAY"])
+        bank_dep_mins = extract_named_bucket(raw, ["BANK DEP AWARD"])
+        ttl_bank_mins = extract_named_bucket(raw, ["TTL BANK OPTS AWARD"])
+
+        total_mins = (
+            sub_ttl_mins
+            + pay_time_mins
+            + addtl_only_mins
+            + reroute_mins
+            + assign_mins
+            + bank_dep_mins
+            + ttl_bank_mins
+        )
+
+        return {
+            "card_type": "RESERVE",
+            "SUB TTL CREDIT": from_minutes(sub_ttl_mins),
+            "PAY TIME ONLY (PAY NO CREDIT)": from_minutes(pay_time_mins),
+            "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only_mins),
+            "REROUTE PAY": from_minutes(reroute_mins),
+            "ASSIGN PAY": from_minutes(assign_mins),
+            "BANK DEP AWARD": from_minutes(bank_dep_mins),
+            "TTL BANK OPTS AWARD": from_minutes(ttl_bank_mins),
+            "TOTAL": from_minutes(total_mins),
+        }
 
 # ======================================================
 # Streamlit UI
@@ -227,7 +234,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
 
 st.set_page_config(page_title="Timecard Pay Calculator", layout="wide")
 st.title("🧮 Timecard Pay Calculator")
-st.caption("Automatically detects RESERVE vs LINEHOLDER and applies the right rules.")
+st.caption("Auto-detects RESERVE vs LINEHOLDER and applies the right rules.")
 
 def handle_clear():
     st.session_state["timecard_text"] = ""
@@ -259,8 +266,8 @@ if "calc" not in st.session_state:
     st.session_state["calc"] = False
 
 st.text_area("Paste your timecard text here:", key="timecard_text", height=260)
-
 colA, colB = st.columns([1, 1])
+
 if colA.button("Calculate", type="primary"):
     st.session_state["calc"] = True
 if colB.button("Clear", on_click=handle_clear):
@@ -275,14 +282,9 @@ if st.session_state["calc"]:
     c2.metric("TOTAL PAY", comps["TOTAL"])
 
     df = pd.DataFrame(
-        [(k, v) for k, v in comps.items() if k not in ("card_type", "debug_rows")],
+        [(k, v) for k, v in comps.items() if k not in ("card_type",)],
         columns=["Component", "Time"]
     )
     st.table(df)
 
-    if "debug_rows" in comps:
-        with st.expander("Debug Rows"):
-            dbg = pd.DataFrame(comps["debug_rows"])
-            st.dataframe(dbg, use_container_width=True)
-
-st.caption("All calculations are local; no data is uploaded or stored.")
+st.caption("All calculations are done locally — no data uploaded or stored.")
