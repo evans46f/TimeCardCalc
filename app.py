@@ -201,38 +201,34 @@ def calc_pay_time_only_reserve(rows: List[Dict[str, Any]]) -> int:
     """
     PAY TIME ONLY (PAY NO CREDIT) for Reserve.
 
-    Include ONLY rows whose NBR is a 'guarantee-type' code:
-      SCC, LOSA, PRPL, TRVL, VAC, RRPY
-    Exclude SICK and actual pairings (0431, 5501, etc.) because those are
-    already included in SUB TTL CREDIT.
+    Rule:
+    - Include any RES row whose NBR is NOT:
+        * SICK
+        * a numeric pairing / trip code (e.g. '0097', '5501', etc.)
+      These are pay-no-credit style days like SCC, LOSA, FOSP, PJRY,
+      VAC, TRVL, PRPL, RRPY, etc.
 
-    For included rows, take the LAST time on that row.
+    - For included rows, add the LAST time on that row.
+    - Exclude actual pairings because those hours are already in SUB TTL CREDIT.
     """
-    guarantee_codes = {"SCC", "LOSA", "PRPL", "TRVL", "VAC", "RRPY"}
-
     total = 0
     for r in rows:
         code = r["nbr"].upper()
         times = r["times"]
         if not times:
             continue
-        if code in guarantee_codes:
-            total += to_minutes(times[-1])
-    return total
 
-def calc_addtl_pay_only_reserve(rows: List[Dict[str, Any]]) -> int:
-    """
-    ADDTL PAY ONLY COLUMN for Reserve:
-    Tail bumps where final time is less than the time right before it.
-    """
-    total = 0
-    for r in rows:
-        times = r["times"]
-        if len(times) >= 2:
-            prev_last = to_minutes(times[-2])
-            last = to_minutes(times[-1])
-            if last < prev_last:
-                total += last
+        # Skip SICK
+        if code == "SICK":
+            continue
+
+        # Skip numeric / pairing-style codes (start with a digit)
+        if re.match(r"^\d", code):
+            continue
+
+        # Everything else counts (SCC, FOSP, PJRY, LOSA, VAC, TRVL, PRPL, RRPY, etc.)
+        total += to_minutes(times[-1])
+
     return total
 
 # ======================================================
