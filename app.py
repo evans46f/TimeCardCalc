@@ -32,11 +32,13 @@ def nbps(text: str) -> str:
 
 def grab_sub_ttl_credit_minutes(raw: str) -> Tuple[int, str]:
     """
-    Get the final period credit.
-    We take the LAST '= H:MM' on any math line, e.g.
-      17:51 + 39:43 + 0:00 = 57:34 - 0:00 + 0:00 = 57:34
+    Get the final period credit (SUB TTL CREDIT / TTL CREDIT).
+    We take the LAST '= H:MM' we see on the math line, e.g.:
+
+      31:34 + 17:57 + 0:00 = 49:31 - 0:00 + 0:00 = 49:31
       68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00
-    -> 57:34 or 72:00.
+
+    -> 49:31 or 72:00.
     """
     t = nbps(raw)
     best_val = 0
@@ -54,9 +56,9 @@ def extract_numeric_field(raw: str, left_label_regex: str) -> int:
     """
     Extract a single H:MM for a 'bank award' style field.
 
-    We scan for:
-      BANK DEP ... AWARD ... H:MM
-      TTL BANK ... OPTS AWARD ... H:MM
+    Looks for something like:
+      BANK DEP ... AWARD ... 0:00
+      TTL BANK ... OPTS AWARD ... 3:26
     """
     t = nbps(raw)
     pat = re.compile(
@@ -68,14 +70,33 @@ def extract_numeric_field(raw: str, left_label_regex: str) -> int:
         return to_minutes(m.group(1))
     return 0
 
+def extract_training_pay_minutes(raw: str) -> int:
+    """
+    Sum DISTRIBUTED TRNG PAY lines, e.g.:
+
+      03JUL25 C365 DISTRIBUTED TRNG PAY:   1:00
+      14JUL25 QC11 DISTRIBUTED TRNG PAY:   1:29
+
+    We add 1:00 + 1:29 = 2:29.
+    """
+    t = nbps(raw)
+    total = 0
+    for m in re.finditer(
+        r"DISTRIBUTED\s+TRNG\s+PAY:\s+(\d{1,3}:[0-5]\d)",
+        t,
+        flags=re.I,
+    ):
+        total += to_minutes(m.group(1))
+    return total
+
 # ======================================================
-# Named pay bucket parsing
+# Named pay buckets
 # ======================================================
 
 def _label_to_regex(lbl: str) -> str:
     """
     Turn 'G/SLIP PAY' into flexible 'G/SLIP\s+PAY'.
-    We escape each token and re-join with \s+ for loose spacing.
+    We escape tokens and re-join with \s+ for loose spacing.
     """
     parts = re.split(r"\s+", lbl.strip())
     esc = [re.escape(p) for p in parts]
@@ -86,7 +107,7 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
     Extract values like:
       G/SLIP PAY : 10:30
       ASSIGN PAY: 0:00
-      REROUTE PAY: 1:22
+      REROUTE PAY: 6:32
     """
     t = nbps(text)
     for lbl in labels:
@@ -98,7 +119,7 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
 
 def extract_res_assign_gslip_bucket(text: str) -> int:
     """
-    Parse 'RES ASSIGN-G/SLIP PAY:' (space or hyphen flexible).
+    Parse 'RES ASSIGN-G/SLIP PAY:' (space/hyphen flexible).
     """
     t = nbps(text)
     m = re.search(
@@ -114,12 +135,15 @@ def extract_res_assign_gslip_bucket(text: str) -> int:
 # Duty row parsing logic
 # ======================================================
 
+# Reserve-coded duties that are ALWAYS extra pay on top of the guarantee
+# (not already "trip credit"): SCC, LOSA, PVEL, VAC, etc.
+# We added "23M7" here after seeing it behave like paid ground duty.
 RES_FALLBACK_ELIGIBLE_CODES = {
-    # reserve "coverage"/standby-style buckets that should stack on top
     "SCC",
     "PVEL",
     "LOSA",
-    "VAC",        # <-- added VAC so PTO-style vacation credit stacks
+    "VAC",
+    "23M7",
     "ADJ-RRPY",
     "ADJ",
     "ADJ/RRPY",
@@ -130,22 +154,31 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
     Parse each duty day row and identify:
     - has_credit_block:
         e.g. '10:30 10:30 10:30 ...' or '7:21 7:21 7:21 ...'
-        That time is already in SUB TTL CREDIT.
+        That "trip credit" is already baked into SUB TTL CREDIT.
     - bump_pay_candidate:
-        little add-on, like 0:07 / 1:22 / 0:13 / 3:23 / 3:38.
-        This is ADDTL PAY ONLY COLUMN.
+        the add-on boost at the end, like 6:32 / 0:36 / 0:07 / 1:22 / 3:23 etc.
+        (ADDTL PAY ONLY COLUMN)
     - main_pay_candidate:
         PAY TIME ONLY (PAY NO CREDIT).
-        Rules:
-          • If nbr has 'RRPY' in it (RRPY, ADJ-RRPY), last time counts.
-          • If row ends [big_time, smaller bump], big_time counts unless:
-                - row is TRANS, or
-                - big_time is clearly a 3x repeated credit block.
-          • Reserve fallback:
-                If duty == RES, no credit block,
-                nbr in RES_FALLBACK_ELIGIBLE_CODES (SCC, LOSA, PVEL, VAC, etc.),
-                take last time.
-                This is what adds SCC 1:00, LOSA 20:00, VAC 32:05, etc.
+        We decide this in tiers:
+
+        1. If the NBR includes 'RRPY' (RRPY, ADJ-RRPY, etc.), we take the last time.
+           That's straight pay.
+
+        2. If the row ends [big_time, smaller bump] (10:49 0:13,
+           or 10:30 10:30 3:23), we take the 'big_time'
+           UNLESS:
+              • it's a TRANS row (training base time we don't double-pay),
+              • or that big_time is clearly the same "trip credit" repeated 3x
+                right before the bump (10:30 10:30 10:30 0:07), which is already
+                included in SUB TTL CREDIT.
+
+        3. Reserve fallback: If duty == RES, there's no detected credit block,
+           and the code (NBR) is in RES_FALLBACK_ELIGIBLE_CODES
+           (SCC / LOSA / PVEL / VAC / 23M7 / etc.),
+           then we treat the last time on that row as payable extra.
+           This is how SCC 1:00, LOSA 15:00, VAC 32:05, 23M7 5:15, etc.
+           get added on top of guarantee.
     """
     t = nbps(raw)
 
@@ -171,13 +204,15 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
         seg_full  = (m.group(0) or "")
         tail_text = (m.group("tail") or "")
 
-        # all H:MM tokens on this row
+        # All H:MM values on this row
         times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg_full)
 
-        # does row mention TRANS?
+        # TRANS row?
         has_trans = "TRANS" in tail_text.upper()
 
-        # detect credit block: same time repeated >=3 times before a bump
+        # Detect credit block: same time repeated >=3 times *before* a bump.
+        # We only flag this if we have at least 4 H:MM tokens AND the last 3
+        # before the final are the same.
         has_credit_block = False
         repeated_credit_value = None
         if len(times) >= 4:
@@ -187,24 +222,25 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 has_credit_block = True
                 repeated_credit_value = last3[0]
 
-        # bump pay candidate (ADDTL PAY ONLY COLUMN)
+        # bump pay (ADDTL PAY ONLY COLUMN):
+        # If final time < previous time, the final time is a bump.
         bump_pay_candidate = None
         if len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
             if to_minutes(last_time) < to_minutes(prev_time):
-                bump_pay_candidate = last_time  # 0:07, 1:22, 0:13, 3:23, etc.
+                bump_pay_candidate = last_time  # e.g. 6:32, 0:36, 0:07, 1:22, etc.
 
-        # main pay candidate (PAY TIME ONLY / PAY NO CREDIT)
+        # main pay (PAY TIME ONLY / PAY NO CREDIT)
         main_pay_candidate = None
 
-        # Case 1: 'RRPY' in pairing code means it's standalone pay (RRPY, ADJ-RRPY...)
+        # Tier 1: RRPY / ADJ-RRPY style pay
         if "RRPY" in nbr:
             if times:
                 main_pay_candidate = times[-1]
 
-        # Case 2: row ends [big_time, smaller bump]
-        # e.g. "10:30 10:30 3:23", "10:49 0:13"
+        # Tier 2: big_time then smaller bump
+        # e.g. "... 10:30 10:30 10:30 6:32" or "10:49 0:13"
         elif len(times) >= 2:
             prev_time = times[-2]
             last_time = times[-1]
@@ -212,7 +248,9 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             last_m = to_minutes(last_time)
 
             if last_m < prev_m:
-                # Include prev_time unless it's TRANS or clearly triple-credit.
+                # We include prev_time unless:
+                #  - TRANS row, OR
+                #  - prev_time is clearly the repeated-credit block time
                 occurrences_prev_before_last = [t for t in times[:-1] if t == prev_time]
                 repeated_block = (
                     has_credit_block
@@ -223,13 +261,12 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
                 if (not has_trans) and (not repeated_block):
                     main_pay_candidate = prev_time
 
-        # Case 3 (reserve fallback logic):
-        # Only for RES rows:
-        # - no credit block
-        # - nbr is in whitelist of reserve-paid codes
-        # - take the last time token
-        #
-        # This now includes VAC, so vacation pay stacks for reserve months.
+        # Tier 3: reserve fallback (SCC / LOSA / PVEL / VAC / 23M7, etc.)
+        # Only if:
+        #  - It's a RES row
+        #  - We did not already assign main_pay_candidate
+        #  - There's no credit block (not a trip with 10:30 10:30 10:30 ...)
+        #  - Code is in the whitelist
         if main_pay_candidate is None:
             if duty == "RES" and times and not has_credit_block:
                 if nbr in RES_FALLBACK_ELIGIBLE_CODES:
@@ -242,8 +279,8 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
             "times": times,
             "has_credit_block": has_credit_block,
             "has_trans": has_trans,
-            "main_pay_candidate": main_pay_candidate,
-            "bump_pay_candidate": bump_pay_candidate,
+            "main_pay_candidate": main_pay_candidate,   # PAY TIME ONLY
+            "bump_pay_candidate": bump_pay_candidate,   # ADDTL PAY ONLY
             "raw": seg_full.strip(),
         })
 
@@ -252,6 +289,7 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
 def detect_card_type(rows: List[Dict[str, Any]]) -> str:
     """
     Decide card type (affects which buckets get summed):
+
       - If we saw any REG rows and NO RES rows → LINEHOLDER
       - Otherwise → RESERVE
     """
@@ -267,7 +305,7 @@ def detect_card_type(rows: List[Dict[str, Any]]) -> str:
 
 def compute_components(raw: str) -> Dict[str, Any]:
     """
-    Gather all buckets needed by either card type.
+    Gather all buckets needed by either Reserve or Lineholder math.
     """
     rows = parse_duty_rows(raw)
     card_type = detect_card_type(rows)
@@ -314,6 +352,9 @@ def compute_components(raw: str) -> Dict[str, Any]:
     bank_dep_award_mins       = extract_numeric_field(raw, r"BANK\s+DEP\s+AWARD")
     ttl_bank_opts_award_mins  = extract_numeric_field(raw, r"TTL\s+BANK\s+OPTS?\s+AWARD")
 
+    # Distributed training pay
+    training_pay_mins = extract_training_pay_minutes(raw)
+
     return {
         "card_type": card_type,
 
@@ -321,7 +362,7 @@ def compute_components(raw: str) -> Dict[str, Any]:
         "sub_ttl_src": sub_src,
 
         "pay_only_main_mins": pay_only_main_mins,     # PAY TIME ONLY
-        "pay_only_bump_mins": pay_only_bump_mins,     # ADDTL PAY ONLY COLUMN
+        "pay_only_bump_mins": pay_only_bump_mins,     # ADDTL PAY ONLY
 
         "reroute_pay_mins": reroute_pay_mins,
         "assign_pay_mins": assign_pay_mins,
@@ -330,6 +371,8 @@ def compute_components(raw: str) -> Dict[str, Any]:
 
         "bank_dep_award_mins": bank_dep_award_mins,
         "ttl_bank_opts_award_mins": ttl_bank_opts_award_mins,
+
+        "training_pay_mins": training_pay_mins,
 
         "debug_rows": debug_rows,
     }
@@ -342,7 +385,7 @@ def compute_totals(raw: str) -> Dict[str, Any]:
     comps = compute_components(raw)
     ct = comps["card_type"]
 
-    # Common buckets to both:
+    # Buckets shared by both card types:
     base_mins = (
         comps["sub_ttl_credit_mins"]
         + comps["pay_only_main_mins"]
@@ -351,20 +394,19 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         + comps["assign_pay_mins"]
         + comps["bank_dep_award_mins"]
         + comps["ttl_bank_opts_award_mins"]
+        + comps["training_pay_mins"]
     )
 
     if ct == "RESERVE":
-        total_mins = (
-            base_mins
-            + comps["res_assign_gslip_mins"]
-            # reserve does NOT add G/SLIP PAY
-        )
+        # Reserve math:
+        # + RES ASSIGN-G/SLIP PAY
+        # (Reserve does NOT add G/SLIP PAY)
+        total_mins = base_mins + comps["res_assign_gslip_mins"]
     else:
-        total_mins = (
-            base_mins
-            + comps["g_slip_pay_mins"]
-            # lineholder does NOT add RES ASSIGN-G/SLIP PAY
-        )
+        # Lineholder math:
+        # + G/SLIP PAY
+        # (Lineholder does NOT add RES ASSIGN-G/SLIP PAY)
+        total_mins = base_mins + comps["g_slip_pay_mins"]
 
     comps["total_mins"] = total_mins
     comps["total_hmm"] = from_minutes(total_mins)
@@ -390,7 +432,7 @@ with st.sidebar:
 
 default_text = ""
 if example_btn_res:
-    # Reserve example (October John ~103:56 logic)
+    # Reserve example (John Oct ~103:56 logic)
     default_text = (
         "MONTHLY TIME DATA 10/24/25 10:16:32 "
         "BID PERIOD: 01OCT25 - 31OCT25 ATL 320 B INIT LOT: 0513 "
@@ -406,7 +448,10 @@ if example_btn_res:
         "17:51 + 39:43 + 0:00 = 57:34 - 0:00 + 0:00 = 57:34 "
         "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 0:00 "
         "G/SLIP PAY : 0:00 ASSIGN PAY: 0:00 RES ASSIGN-G/SLIP PAY: 10:30 "
-        "REROUTE PAY: 10:30 END OF DISPLAY"
+        "REROUTE PAY: 10:30 "
+        "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
+        "14JUL25 QC11 DISTRIBUTED TRNG PAY: 1:29 "
+        "END OF DISPLAY"
     )
 
 if example_btn_line:
@@ -427,7 +472,10 @@ if example_btn_line:
         "68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 "
         "BANK DEP AWARD 0:00 TTL BANK OPTS AWARD 3:26 "
         "G/SLIP PAY : 10:30 REROUTE PAY: 0:00 ASSIGN PAY: 0:00 "
-        "RES ASSIGN-G/SLIP PAY: 0:00 END OF DISPLAY"
+        "RES ASSIGN-G/SLIP PAY: 0:00 "
+        "03JUL25 C365 DISTRIBUTED TRNG PAY: 1:00 "
+        "14JUL25 QC11 DISTRIBUTED TRNG PAY: 1:29 "
+        "END OF DISPLAY"
     )
 
 text_value = ""
@@ -476,6 +524,7 @@ if st.session_state.get("calc"):
         ("G/SLIP PAY", from_minutes(comps["g_slip_pay_mins"])),
         ("BANK DEP AWARD", from_minutes(comps["bank_dep_award_mins"])),
         ("TTL BANK OPTS AWARD", from_minutes(comps["ttl_bank_opts_award_mins"])),
+        ("DISTRIBUTED TRNG PAY", from_minutes(comps["training_pay_mins"])),
         ("TOTAL (Applied Formula Above)", comps["total_hmm"]),
     ]
     df = pd.DataFrame(breakdown_rows, columns=["Component", "Time"])
@@ -486,9 +535,11 @@ if st.session_state.get("calc"):
         st.dataframe(dbg, use_container_width=True)
         st.caption(
             "Reserve total = SUB TTL CREDIT + PAY TIME ONLY + ADDTL PAY ONLY + "
-            "REROUTE PAY + ASSIGN PAY + RES ASSIGN-G/SLIP PAY + BANK DEP AWARD + TTL BANK OPTS AWARD. "
+            "REROUTE PAY + ASSIGN PAY + RES ASSIGN-G/SLIP PAY + BANK DEP AWARD + "
+            "TTL BANK OPTS AWARD + DISTRIBUTED TRNG PAY. "
             "Lineholder total = SUB TTL CREDIT + PAY TIME ONLY + ADDTL PAY ONLY + "
-            "REROUTE PAY + ASSIGN PAY + G/SLIP PAY + BANK DEP AWARD + TTL BANK OPTS AWARD."
+            "REROUTE PAY + ASSIGN PAY + G/SLIP PAY + BANK DEP AWARD + "
+            "TTL BANK OPTS AWARD + DISTRIBUTED TRNG PAY."
         )
 
 st.caption("All math runs locally. No data stored.")
