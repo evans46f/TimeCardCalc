@@ -37,24 +37,21 @@ def grab_labeled_time_flex(text: str, variants: List[str]) -> int:
 
 def grab_ttl_credit(raw: str) -> int:
     t = nbps(raw)
-    # Preferred line
-    m = re.search(r"CREDIT\s+APPLICABLE\s+TO\s+REG\s+G/SLIP\s+PAY\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
+    # Preferred: "CREDIT APPLICABLE TO REG G/S SLIP PAY:" (allow optional space after slash)
+    m = re.search(r"CREDIT\s+APPLICABLE\s+TO\s+REG\s+G/\s*SLIP\s+PAY\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
     if m:
         return to_minutes(m.group(1))
     # Alternate label
     m = re.search(r"TTL\s+.*CREDIT\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
     if m:
         return to_minutes(m.group(1))
-    # Equation line: take last "= H:MM"
+    # Equation line fallback: any line that contains '=' and time tokens; take the LAST '= H:MM'
     for line in t.splitlines():
-        if re.search(r"SUB\s+TTL\s+CREDIT", line, flags=re.I) or re.search(r"\bGUAR\b", line, flags=re.I):
+        if '=' in line and re.search(r"\d{1,3}:[0-5]\d", line):
             all_eq = list(re.finditer(r"=\s*(\d{1,3}:[0-5]\d)", line))
             if all_eq:
                 return to_minutes(all_eq[-1].group(1))
     return 0
-
-EXTRA_SET = {"SCC","PVEL","LOSA","ADJ-RRPY","ADJ-RR","ADJ","RRPY"}
-
 def sum_daily_extras(raw: str) -> Tuple[int, int]:
     """Return (payTimeExtras, payOnlyTotal)"""
     t = nbps(raw)
