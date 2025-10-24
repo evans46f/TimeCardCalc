@@ -1,6 +1,5 @@
-
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 import pandas as pd
@@ -35,58 +34,78 @@ def grab_labeled_time_flex(text: str, variants: List[str]) -> int:
             return to_minutes(m.group(1))
     return 0
 
-def grab_ttl_credit(raw: str) -> int:
+def grab_ttl_credit(raw: str) -> Tuple[int, str]:
     t = nbps(raw)
-    # Preferred: "CREDIT APPLICABLE TO REG G/S SLIP PAY:" (allow optional space after slash)
     m = re.search(r"CREDIT\s+APPLICABLE\s+TO\s+REG\s+G/\s*SLIP\s+PAY\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
     if m:
-        return to_minutes(m.group(1))
-    # Alternate label
+        return to_minutes(m.group(1)), "CREDIT APPLICABLE line"
     m = re.search(r"TTL\s+.*CREDIT\s*:\s*(\d{1,3}:[0-5]\d)", t, flags=re.I)
     if m:
-        return to_minutes(m.group(1))
-    # Equation line fallback: any line that contains '=' and time tokens; take the LAST '= H:MM'
+        return to_minutes(m.group(1)), "TTL CREDIT label"
     for line in t.splitlines():
-        if '=' in line and re.search(r"\d{1,3}:[0-5]\d", line):
+        if "=" in line and re.search(r"\d{1,3}:[0-5]\d", line):
             all_eq = list(re.finditer(r"=\s*(\d{1,3}:[0-5]\d)", line))
             if all_eq:
-                return to_minutes(all_eq[-1].group(1))
-    return 0
-def sum_daily_extras(raw: str) -> Tuple[int, int]:
-    """Return (payTimeExtras, payOnlyTotal)"""
+                return to_minutes(all_eq[-1].group(1)), "Equation fallback"
+    return 0, "Not found"
+
+EXTRA_NBR_CODES = {"SCC","PVEL","LOSA","ADJ-RRPY","ADJ-RR","ADJ","RRPY"}
+
+ROW_SEGMENT_RE = re.compile(
+    r"(?P<date>\d{2}[A-Z]{3})\s+RES\s+(?P<nbr>[A-Z0-9-]+)(?P<tail>.*?)(?=\d{2}[A-Z]{3}\s+RES\b|RES\s+OTHER\s+SUB\s+TTL|CREDIT\s+APPLICABLE|END OF DISPLAY|$)",
+    re.I | re.S
+)
+
+def segment_rows(raw: str) -> List[Dict[str, Any]]:
     t = nbps(raw)
-    # Segment rows robustly, single or multi line
-    seg_re = re.compile(r"(\d{2}[A-Z]{3}\s+RES\s+[A-Z0-9-]+)(.*?)(?=\d{2}[A-Z]{3}\s+RES\b|RES\s+OTHER\s+SUB\s+TTL|CREDIT\s+APPLICABLE|END OF DISPLAY|$)", re.I | re.S)
+    rows = []
+    for m in ROW_SEGMENT_RE.finditer(t):
+        date = (m.group("date") or "").upper()
+        nbr  = (m.group("nbr") or "").upper()
+        seg  = (m.group(0) or "")
+        times = re.findall(r"\b\d{1,3}:[0-5]\d\b", seg)
+        rows.append({"date": date, "nbr": nbr, "times": times, "segment": seg})
+    return rows
+
+def sum_daily_extras_with_debug(raw: str) -> Tuple[int, int, List[Dict[str, Any]]]:
     pay_extras = 0
-    pay_only = 0
+    pay_only   = 0
+    debug_rows = []
 
-    for m in seg_re.finditer(t):
-        header = m.group(1)
-        tail = m.group(2) or ""
-        header_clean = re.sub(r"\s+", " ", header).strip()
-        parts = [p for p in header_clean.split(" ") if p]
-        nbr = (parts[2] if len(parts) >= 3 else "").upper()
+    for row in segment_rows(raw):
+        nbr = row["nbr"]
+        times = row["times"]
+        counted_extra = 0
+        counted_po    = 0
+        reasons = []
 
-        # Collect all H:MM on this row
-        row_times = re.findall(r"\b\d{1,3}:[0-5]\d\b", header + " " + tail)
+        if len(times) >= 5:
+            counted_po = to_minutes(times[-1])
+            pay_only += counted_po
+            reasons.append(f"PAY ONLY added {times[-1]} (>=5 time tokens)")
 
-        # PAY ONLY: rows with >=5 time tokens → last is pay-only
-        if len(row_times) >= 5:
-            pay_only += to_minutes(row_times[-1])
+        if nbr in EXTRA_NBR_CODES and times:
+            counted_extra = to_minutes(times[-1])
+            pay_extras += counted_extra
+            reasons.append(f"EXTRA added {times[-1]} (NBR={nbr})")
 
-        # Extras rows → last time on that row is PAY TIME
-        if nbr in EXTRA_SET and row_times:
-            pay_extras += to_minutes(row_times[-1])
+        debug_rows.append({
+            "Date": row["date"],
+            "NBR": nbr,
+            "All times on row": ", ".join(times) if times else "",
+            "Extra added (H:MM)": from_minutes(counted_extra) if counted_extra else "",
+            "Pay Only added (H:MM)": from_minutes(counted_po) if counted_po else "",
+            "Notes": " | ".join(reasons) if reasons else ""
+        })
 
-    return pay_extras, pay_only
+    return pay_extras, pay_only, debug_rows
 
-def compute_totals(text: str):
-    """Return (total_hmm, total_decimal, breakdown_rows)"""
+def compute_totals(text: str) -> Tuple[str, float, List[Tuple[str, str]], List[Dict[str, Any]], str]:
     t = nbps(text or "")
     if not t.strip():
-        return "0:00", 0.0, [("Total", "0:00")]
+        return "0:00", 0.0, [("Total", "0:00")], [], "Not found"
 
-    ttl_credit = grab_ttl_credit(t)
+    ttl_credit, ttl_src = grab_ttl_credit(t)
 
     res_assign_gslip = grab_labeled_time_flex(t, ["RES ASSIGN-G/SLIP PAY","RES ASSIGN G/SLIP PAY"])
     reroute_pay      = grab_labeled_time_flex(t, ["REROUTE PAY"])
@@ -95,7 +114,7 @@ def compute_totals(text: str):
     s_slip_pay       = grab_labeled_time_flex(t, ["S/SLIP PAY","S - SLIP PAY","S SLIP PAY"])
     pbs_pr_pay       = grab_labeled_time_flex(t, ["PBS/PR PAY","PBS PR PAY"])
 
-    pay_extras, pay_only = sum_daily_extras(t)
+    pay_extras, pay_only, debug_rows = sum_daily_extras_with_debug(t)
 
     rows = [
         ("TTL CREDIT", from_minutes(ttl_credit)),
@@ -112,7 +131,7 @@ def compute_totals(text: str):
     rows.append(("Total", from_minutes(total_mins)))
     total_hmm = from_minutes(total_mins)
     total_dec = round(total_mins / 60.0, 2)
-    return total_hmm, total_dec, rows
+    return total_hmm, total_dec, rows, debug_rows, ttl_src
 
 # ==============================
 # Streamlit UI
@@ -128,7 +147,6 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload timecard text (.txt)", type=["txt"])
     example_btn = st.button("Load Example")
 
-# Text input area
 default_text = ""
 if example_btn:
     default_text = (
@@ -159,40 +177,43 @@ if uploaded is not None:
     except Exception:
         text_value = uploaded.read().decode("latin1", errors="ignore")
 
-text_area = st.text_area("Paste your timecard text here:", value=(text_value or default_text), height=240)
+text_area = st.text_area("Paste your timecard text here:", value=(text_value or default_text), height=260)
 
 st.divider()
-colA, colB, colC = st.columns([1,1,2])
+colA, colB = st.columns([1,1])
 
-with colA:
-    if st.button("Calculate", type="primary"):
-        st.session_state["calc"] = True
-
-with colB:
-    clear = st.button("Clear")
+calc = colA.button("Calculate", type="primary")
+clear = colB.button("Clear")
 
 if clear:
     st.session_state.pop("calc", None)
     st.experimental_rerun()
 
+if calc:
+    st.session_state["calc"] = True
+
 if st.session_state.get("calc"):
-    hmm, dec, rows = compute_totals(text_area)
+    hmm, dec, rows, debug_rows, ttl_src = compute_totals(text_area)
+
     st.subheader("Results")
-    m1, m2 = st.columns(2)
+    m1, m2, m3 = st.columns(3)
     with m1:
         st.metric("Total Pay (H:MM)", hmm)
     with m2:
         st.metric("Total Pay (Decimal)", f"{dec:.2f}")
+    with m3:
+        st.metric("TTL Credit Source", ttl_src)
 
-    # Breakdown table
     df = pd.DataFrame(rows, columns=["Component", "Time"])
-    st.table(df.style.hide(axis="index"))
+    st.table(df)
 
-    # Download breakdown CSV
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download breakdown (CSV)", data=csv, file_name="timecard_breakdown.csv", mime="text/csv")
 
-    # Copyable total
-    st.code(hmm, language="text")
+    with st.expander("🔎 Parse Debug (what got counted and why)"):
+        dbg_df = pd.DataFrame(debug_rows)
+        st.write("Each timecard row the parser detected:")
+        st.dataframe(dbg_df, use_container_width=True)
+        st.caption("Rules: (1) If NBR is in {SCC,PVEL,LOSA,ADJ-RRPY,ADJ-RR,ADJ,RRPY}, the last time on that row is added as Extra Pay. (2) If a row has ≥5 time tokens, the last is added as Pay Only.")
 
-st.caption("Tip: Paste the entire report as one line or with original line breaks—both work.")
+st.caption("Tip: Works with one-line or multi-line timecards. No data is stored; parsing happens in memory.")
