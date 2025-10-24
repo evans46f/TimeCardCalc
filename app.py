@@ -277,14 +277,20 @@ def parse_duty_rows(raw: str) -> List[Dict[str, Any]]:
 
         # Rule B: RES guarantee-style SCC/LOSA/etc (not SICK/TOFF/TRANS)
         if main_pay_candidate is None:
-            if duty == "RES" and times and not has_credit_block:
-                unique_times = set(times)
-                if (
-                    len(unique_times) == 1
-                    and nbr not in ("SICK", "TOFF")
-                    and not has_trans
-                ):
-                    main_pay_candidate = times[-1]
+    if duty == "RES" and times and not has_credit_block:
+        if nbr not in ("SICK", "TOFF") and not has_trans:
+            unique_times = set(times)
+            # case 1: all times identical (SCC 1:00 1:00)
+            all_same = (len(unique_times) == 1)
+
+            # case 2: last two times identical (0466 1:23 5:15 5:15)
+            last_two_same = False
+            if len(times) >= 2 and times[-1] == times[-2]:
+                last_two_same = True
+
+            if all_same or last_two_same:
+                main_pay_candidate = times[-1]
+
 
         # Rule C: REG single-pay (e.g. "44WD 10:00")
         if main_pay_candidate is None:
