@@ -31,17 +31,34 @@ def clean(text: str) -> str:
 
 def detect_card_type(raw: str) -> str:
     """
-    Look at DAY DES column.
-    If we see RES anywhere -> RESERVE
-    Else if we see REG anywhere -> LINEHOLDER
-    Else default RESERVE.
+    Decide RESERVE vs LINEHOLDER by looking at the actual duty rows,
+    not the summary block.
+
+    Logic:
+    - If any line matches "<DD><MMM><spaces>RES<spaces>" → RESERVE
+    - Else if any line matches "<DD><MMM><spaces>REG<spaces>" → LINEHOLDER
+    - Else default RESERVE
     """
+
     t = clean(raw).upper()
-    if re.search(r"\bRES\b", t):
+
+    # look for actual duty rows like "05MAR   RES" or "01JUN REG"
+    saw_res_row = re.search(r"\b\d{2}[A-Z]{3}\s+RES\b", t) is not None
+    saw_reg_row = re.search(r"\b\d{2}[A-Z]{3}\s+REG\b", t) is not None
+
+    if saw_res_row and not saw_reg_row:
         return "RESERVE"
-    if re.search(r"\bREG\b", t):
+    if saw_reg_row and not saw_res_row:
         return "LINEHOLDER"
+
+    # tie-breaker:
+    # if both somehow appear (mixed month with RES and REG days),
+    # we'll call that RESERVE only if there's at least one RES row.
+    if saw_res_row and saw_reg_row:
+        return "RESERVE"
+
     return "RESERVE"
+
 
 
 # ======================================================
