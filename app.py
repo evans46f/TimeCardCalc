@@ -105,9 +105,8 @@ def extract_named_bucket(text: str, labels: List[str]) -> int:
     Looks for values after named buckets like:
       G/SLIP PAY : 10:30
       ASSIGN PAY: 0:00
-      RES ASSIGN-G/SLIP PAY: 5:15
+      RES ASSIGN-G/SLIP PAY: 5:23
       REROUTE PAY: 0:00
-      BANK DEP AWARD 0:00
       TTL BANK OPTS AWARD 0:00
     """
     t = clean(text)
@@ -136,8 +135,8 @@ def grab_sub_ttl_credit_minutes(raw: str) -> int:
     """
     We want the FINAL total credit from the guarantee math block.
     Example:
-      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00  -> 72:00
-      10:30 + 40:49 + 0:00 = 51:19 - 0:00 + 0:00 = 51:19 -> 51:19
+      39:37 + 35:08 + 0:00 = 74:45 - 0:00 + 0:00 = 74:45 -> 74:45
+      68:34 + 0:00 + 0:00 = 68:34 - 0:00 + 3:26 = 72:00 -> 72:00
     """
     t = clean(raw)
     eq_times = re.findall(r"=\s*([0-9]{1,3}:[0-5]\d)", t)
@@ -149,7 +148,7 @@ def extract_training_pay_minutes(raw: str) -> int:
     """
     Sum all 'DISTRIBUTED TRNG PAY:' lines.
     Example:
-      ... DISTRIBUTED TRNG PAY:   1:52
+      DISTRIBUTED TRNG PAY:   1:52
     """
     t = clean(raw)
     total = 0
@@ -181,7 +180,7 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
     """
     ADDTL PAY ONLY COLUMN for lineholder:
     If last time < previous time, add the last time.
-    (captures tails like 0:13, 0:38, 3:38, 3:23...)
+    Captures tails like 0:13, 0:38, 3:38, 3:23...
     """
     total = 0
     for r in rows:
@@ -199,51 +198,59 @@ def calc_addtl_pay_only_lineholder(rows: List[Dict[str, Any]]) -> int:
 
 def calc_pay_time_only_reserve_structural(rows: List[Dict[str, Any]]) -> int:
     """
-    Reserve PAY TIME ONLY under the new structural rule:
+    Reserve PAY TIME ONLY lines under final structural rule:
 
-    We include rows that look like 'pay/no-credit guarantee days':
-    - They have SKED TIME / PAY TIME values,
-    - but are NOT obvious trip/credit rows.
+    Include a row if ALL are true:
+    - It does NOT have BLOCK HRS (flight block):
+        has_block_hrs = len(times) >= 2 AND first time < second time (numerically)
+        e.g. "1:51 10:30 10:30 10:30" → block hrs present
+    - It does NOT have CREDIT populated:
+        has_credit_triplet = len(times) >= 3 AND last 3 times identical
+        e.g. "8:48 8:48 8:48" (SICK), "4:24 4:24 4:24" (TOFF)
+    - If either has_block_hrs OR has_credit_triplet, exclude.
+    - Otherwise include, and add the LAST time shown.
 
-    Heuristic:
-    - times = all H:MM tokens in the row.
-    - If len(times) >= 2 AND:
-        first_val < second_val
-        AND times[1] repeats later in the row,
-      then it's a trip/credit-style row (BLOCK HRS then CREDIT), so EXCLUDE.
-      Examples:
-        "2:46 5:15 5:15"
-        "11:09 15:45 15:45 15:45 3:36"
-    - Otherwise, INCLUDE this row and add the LAST time in the row.
-      This captures SCC, TRVL, PRPL, FOSP, PJRY, VAC, RRPY, SICK, etc.,
-      and ignores 0881/6249/etc flying/credit rows.
+    This will:
+    - Count SCC rows like "1:00 1:00"
+    - Exclude SICK / TOFF (triple repeat)
+    - Exclude pairings or anything with block hrs / credit
+    - Exclude rows that look like G/slip style with block hrs present
     """
     total = 0
+
     for r in rows:
         times = r["times"]
         if not times:
             continue
 
-        is_trip_style = False
-        if len(times) >= 2:
-            first_val = to_minutes(times[0])
-            second_val = to_minutes(times[1])
-            repeats_second = times.count(times[1]) > 1
-            if first_val < second_val and repeats_second:
-                # looks like BLOCK HRS -> CREDIT repeated
-                is_trip_style = True
+        mins_list = [to_minutes(t) for t in times]
 
-        if is_trip_style:
+        # detect block hrs style (first < second)
+        has_block_hrs = False
+        if len(mins_list) >= 2:
+            if mins_list[0] < mins_list[1]:
+                has_block_hrs = True
+
+        # detect "credit in table" via triplet of identical times at end
+        has_credit_triplet = (
+            len(times) >= 3 and
+            times[-1] == times[-2] == times[-3]
+        )
+
+        # if row has block hrs OR looks like it's populating CREDIT, skip
+        if has_block_hrs or has_credit_triplet:
             continue
 
-        total += to_minutes(times[-1])
+        # Otherwise count last time in row
+        total += mins_list[-1]
 
     return total
 
 def calc_addtl_pay_only_reserve(rows: List[Dict[str, Any]]) -> int:
     """
     ADDTL PAY ONLY COLUMN for Reserve:
-    Tail bumps where final time is less than the time right before it.
+    Tail bumps where final time is less than the time right before it
+    (e.g. '... 15:45 15:45 15:45 3:36' -> add 3:36).
     """
     total = 0
     for r in rows:
@@ -294,13 +301,16 @@ def compute_totals(raw: str) -> Dict[str, Any]:
         }
 
     else:
-        # RESERVE (new rules)
+        # RESERVE
         rows = parse_reserve_rows(raw)
 
         ttl_credit_mins = grab_sub_ttl_credit_minutes(raw)
         pay_time_only_mins = calc_pay_time_only_reserve_structural(rows)
         addtl_only_mins = calc_addtl_pay_only_reserve(rows)
+
         res_assign_gslip_mins = extract_named_bucket(raw, ["RES ASSIGN-G/SLIP PAY"])
+        assign_mins = extract_named_bucket(raw, ["ASSIGN PAY"])
+        reroute_mins = extract_named_bucket(raw, ["REROUTE PAY"])
         ttl_bank_opts_award_mins = extract_named_bucket(raw, ["TTL BANK OPTS AWARD"])
         training_mins = extract_training_pay_minutes(raw)
 
@@ -309,6 +319,8 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             + pay_time_only_mins
             + addtl_only_mins
             + res_assign_gslip_mins
+            + assign_mins
+            + reroute_mins
             + training_mins
             + ttl_bank_opts_award_mins
         )
@@ -319,6 +331,8 @@ def compute_totals(raw: str) -> Dict[str, Any]:
             "PAY TIME ONLY (structural)": from_minutes(pay_time_only_mins),
             "ADDTL PAY ONLY COLUMN": from_minutes(addtl_only_mins),
             "RES ASSIGN-G/SLIP PAY": from_minutes(res_assign_gslip_mins),
+            "ASSIGN PAY": from_minutes(assign_mins),
+            "REROUTE PAY": from_minutes(reroute_mins),
             "DISTRIBUTED TRNG PAY": from_minutes(training_mins),
             "TTL BANK OPTS AWARD": from_minutes(ttl_bank_opts_award_mins),
             "TOTAL": from_minutes(total_mins),
@@ -358,17 +372,19 @@ with st.sidebar:
 
     if st.button("Load Reserve Example"):
         st.session_state["timecard_text"] = (
-            "02SEP RES SCC 1:00 1:00 "
-            "03SEP RES 0881 9:15 15:45 15:45 15:45 "
-            "09SEP RES SCC 2:00 2:00 "
-            "10SEP RES SCC 1:00 1:00 "
-            "11SEP RES SCC 1:00 1:00 "
-            "17SEP RES 6249 11:09 15:45 15:45 15:45 3:36 "
-            "24SEP RES TRVL 2:00 2:00 "
-            "25SEP RES PRPL 10:00 10:00 "
-            "29SEP RES 0171 4:24 5:15 5:15 "
-            "31:30 + 33:32 + 0:00 = 65:02 - 0:00 + 0:00 = 65:02 "
-            'RES ASSIGN-G/SLIP PAY: 5:15 '
+            "01AUG RES SICK 8:48 8:48 8:48 "
+            "04AUG RES 0142 5:09 5:23 5:23 "
+            "06AUG RES SCC 1:00 1:00 "
+            "07AUG RES 0054 1:51 10:30 10:30 10:30 "
+            "13AUG RES SCC 1:00 1:00 "
+            "14AUG RES SCC 1:00 1:00 "
+            "16AUG RES TOFF 4:24 4:24 4:24 "
+            "20AUG RES 0733 2:30 5:25 5:25 5:25 "
+            "27AUG RES 0537 8:28 10:30 10:30 10:30 "
+            "39:37 + 35:08 + 0:00 = 74:45 - 0:00 + 0:00 = 74:45 "
+            "RES ASSIGN-G/SLIP PAY: 5:23 "
+            "ASSIGN PAY: 0:00 "
+            "REROUTE PAY: 0:00 "
             "END OF DISPLAY"
         )
 
